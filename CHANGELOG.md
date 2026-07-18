@@ -1,4 +1,4 @@
-0.0.7 (unreleased)
+0.0.7 (2026-07-18)
 ------------------
 
 - replace pygame w/ pygame-ce
