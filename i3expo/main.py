@@ -910,11 +910,10 @@ def run():
     i3_thread.start()
 
     # TODO: consider higher interval for non-focused WS; just to shed some load
+    #os.nice(10)  # as per usual, 19 is max; remember decreasing nice is impossible as regular user
     while True:
         time.sleep(LOOP_INTERVAL)
-        # os.nice(10)
         update_state(i3, rate_limit_period=LOOP_INTERVAL, all_active_ws=True, force=True)
-        # os.nice(-10)
 
 
 if __name__ == '__main__':  # pragma: no cover
