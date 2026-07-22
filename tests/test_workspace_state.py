@@ -1,4 +1,5 @@
 import ctypes
+import configparser
 from types import SimpleNamespace
 
 from i3expo import main
@@ -153,9 +154,81 @@ def test_missing_preview_sweep_captures_only_nonempty_workspace_and_restores_foc
     assert main.GLOBAL_KNOWLEDGE['active'] == 'a'
     assert main.PREVIEW_SWEEP_RUNNING is False
 
+    connection.commands.clear()
+    main.capture_missing_workspace_previews(
+        connection,
+        ['a', 'k', 'p', 'b'],
+        force=True,
+    )
+    assert connection.commands == [
+        'workspace --no-auto-back-and-forth "k"',
+        'workspace --no-auto-back-and-forth "b"',
+        '[con_id=10] focus',
+    ]
+
 
 def test_i3_workspace_name_is_quoted():
     assert main.quote_i3_string('a "quoted" \\ name') == '"a \\"quoted\\" \\\\ name"'
+
+
+def test_direct_key_selects_matching_workspace():
+    reset_knowledge()
+    main.GLOBAL_KNOWLEDGE['wss'] = {
+        '1': {'name': '1'},
+        'a': {'name': 'a'},
+        'k': {'name': 'k'},
+    }
+    tiles = {0: {'ws': '1'}, 1: {'ws': 'a'}, 2: {'ws': 'k'}}
+
+    assert main.direct_workspace_command('1', tiles) == (
+        'workspace --no-auto-back-and-forth "1"'
+    )
+    assert main.direct_workspace_command('a', tiles) == (
+        'workspace --no-auto-back-and-forth "a"'
+    )
+    assert main.direct_workspace_command('k', tiles) == (
+        'workspace --no-auto-back-and-forth "k"'
+    )
+    assert main.direct_workspace_command('x', tiles) is None
+
+
+def test_global_shortcut_parser():
+    assert main.parse_global_shortcut('Mod4+e') == (64, 'e')
+    assert main.parse_global_shortcut('Ctrl+Shift+space') == (5, 'space')
+    assert main.parse_global_shortcut('') is None
+
+
+def test_first_run_creates_editable_default_config(tmp_path, monkeypatch):
+    config_path = tmp_path / 'i3expo' / 'config'
+    config = configparser.ConfigParser(converters={'color': main.get_color})
+    monkeypatch.setattr(main, 'CONFIG', config, raising=False)
+    monkeypatch.setattr(main, 'CONFIG_FILE', str(config_path), raising=False)
+
+    main.read_config()
+
+    text = config_path.read_text(encoding='utf-8')
+    assert 'bgcolor = #0A001F' in text
+    assert 'frame_active_color = #00D7FF' in text
+    assert 'names_color = #FF5FFF' in text
+    assert 'names_font = default' in text
+    assert 'startup_scan = true' in text
+    assert 'toggle_shortcut = Mod4+e' in text
+    assert config.get('CONF', 'bgcolor') == '#0A001F'
+
+
+def test_existing_config_is_not_overwritten(tmp_path, monkeypatch):
+    config_path = tmp_path / 'i3expo' / 'config'
+    config_path.parent.mkdir()
+    custom = '[CONF]\nbgcolor = #123456\ntoggle_shortcut =\n'
+    config_path.write_text(custom, encoding='utf-8')
+    config = configparser.ConfigParser(converters={'color': main.get_color})
+    monkeypatch.setattr(main, 'CONFIG', config, raising=False)
+    monkeypatch.setattr(main, 'CONFIG_FILE', str(config_path), raising=False)
+
+    main.read_config()
+
+    assert config_path.read_text(encoding='utf-8') == custom
+    assert config.get('CONF', 'bgcolor') == '#123456'
 
 
 def test_rename_preserves_workspace_order_and_active_key():

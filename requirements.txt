@@ -9,3 +9,4 @@ i3ipc
 pyxdg
 Pillow
 tendo
+python-xlib

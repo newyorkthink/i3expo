@@ -58,6 +58,7 @@ jobs:
           import pygame
           import pulp
           import xdg
+          import Xlib
           from PIL import Image
           from tendo import singleton
           from i3expo.main import workspace_key
@@ -89,12 +90,14 @@ jobs:
             --collect-submodules i3ipc \
             --collect-submodules xdg \
             --collect-submodules tendo \
+            --collect-submodules Xlib \
             --copy-metadata pygame-ce \
             --copy-metadata pulp \
             --copy-metadata i3ipc \
             --copy-metadata pyxdg \
             --copy-metadata Pillow \
             --copy-metadata tendo \
+            --copy-metadata python-xlib \
             --add-data "i3expo/prtscn.so:i3expo" \
             appimage_entry.py
 
@@ -179,7 +182,7 @@ jobs:
         run: |
           set -euo pipefail
           RELEASE_TITLE="i3expo Stable"
-          RELEASE_NOTES="Stable x86_64 AppImage for i3/X11. Includes named workspace handling, first-open capture for unseen non-empty workspaces, preserved workspace order, persistent preview caching, active preview refresh, a warning-free font fallback, and a borderless overview window. This workflow runs only when started manually."
+          RELEASE_NOTES="Stable x86_64 AppImage for i3/X11. Includes direct workspace keys, an editable first-run config and cyberpunk default theme, a configurable global shortcut, automatic startup capture for unseen non-empty workspaces, named workspace handling, persistent preview caching, and a borderless overview window. This workflow runs only when started manually."
 
           if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
             gh release upload "$RELEASE_TAG" \

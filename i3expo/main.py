@@ -43,10 +43,52 @@ pp = pprint.PrettyPrinter(indent=4)
 
 GLOBAL_UPDATES_RUNNING = True  # if false, we don't grab any screenshots/update internal state
 PREVIEW_SWEEP_RUNNING = False  # true while unseen workspaces are visited for their first preview
+SHORTCUT_THREAD = None
 
 qm_cache = {}  # screen_w x screen_h mapped against rendered question mark for missing tiles
 LOCK = None
 LOGGER = logging.getLogger(__name__)
+
+DEFAULT_CONFIG_TEMPLATE = '''# i3expo user configuration
+# Send SIGHUP to reload theme/layout values; restart after changing shortcut.
+[CONF]
+bgcolor = #0A001F
+frame_active_color = #00D7FF
+frame_inactive_color = #00D7FF
+frame_missing_color = #00D7FF
+tile_missing_color = #0A001F
+
+padding_percent_x = 5
+padding_percent_y = 5
+spacing_percent_x = 4
+spacing_percent_y = 4
+frame_width_px = 3
+
+names_show = true
+# "default" is pygame's bundled font and is available inside the AppImage.
+names_font = default
+names_fontsize = 25
+names_color = #FF5FFF
+highlight_percentage = 20
+
+forced_update_interval_sec = 10.0
+debounce_period_sec = 1.0
+output_blacklist =
+win_class_blacklist = i3expo
+
+# Automatically visit every non-empty workspace once at startup so X11 can
+# render and refresh it. A small visible switch is unavoidable.
+startup_scan = true
+workspace_capture_delay_sec = 0.2
+
+# Global X11 shortcut. Examples: Mod4+e, Alt+Tab, Ctrl+Shift+space.
+# Leave empty to disable it and use an i3 bindsym instead.
+toggle_shortcut = Mod4+e
+
+store_state_on_restart = true
+max_persisted_state_age_sec = 604800
+log_lvl = INFO
+'''
 
 
 # def _runtime_path() -> str:
@@ -223,7 +265,11 @@ def signal_toggle_ui(signal, stack_frame):
 
     wss = shown_ws()
     if len(wss) > 1:  # i.e. should show UI
-        capture_missing_workspace_previews(i3, wss)
+        capture_missing_workspace_previews(
+            i3,
+            wss,
+            CONFIG.getfloat('CONF', 'workspace_capture_delay_sec'),
+        )
         wss = shown_ws()
         # Refresh the visible workspace immediately before drawing the grid;
         # missing non-empty workspaces were mapped and captured just above.
@@ -249,11 +295,11 @@ def get_color(raw):
 def read_config():
     CONFIG.read_dict({
         'CONF': {
-            'bgcolor'                    : 'gray20',
-            'frame_active_color'         : '#5a6da4',
-            'frame_inactive_color'       : '#93afb3',
-            'frame_missing_color'        : '#ffe6d0',
-            'tile_missing_color'         : 'gray40',
+            'bgcolor'                    : '#0A001F',
+            'frame_active_color'         : '#00D7FF',
+            'frame_inactive_color'       : '#00D7FF',
+            'frame_missing_color'        : '#00D7FF',
+            'tile_missing_color'         : '#0A001F',
 
             'padding_percent_x'          : 5,
             'padding_percent_y'          : 5,
@@ -267,10 +313,13 @@ def read_config():
             'win_class_blacklist'        : SELF_WIN_CLASS,  # comma-separated values as a string; empty string for none
 
             'names_show'                 : True,
-            'names_font'                 : 'verdana',  # list with pygame.font.get_fonts()
+            'names_font'                 : 'default',
             'names_fontsize'             : 25,
-            'names_color'                : 'white',
+            'names_color'                : '#FF5FFF',
             'highlight_percentage'       : 20,
+            'startup_scan'               : True,
+            'workspace_capture_delay_sec': 0.2,
+            'toggle_shortcut'            : 'Mod4+e',
             'screenshot_lib_path'        : os.path.join(os.path.dirname(os.path.realpath(__file__)), 'prtscn.so'),
             'store_state_on_restart'     : True,
             'max_persisted_state_age_sec': 604800,
@@ -279,15 +328,18 @@ def read_config():
         }
     })
 
+    if not os.path.exists(CONFIG_FILE):
+        try:
+            os.makedirs(os.path.dirname(CONFIG_FILE), mode=0o700, exist_ok=True)
+            with open(CONFIG_FILE, 'x', encoding='utf-8') as config_file:
+                config_file.write(DEFAULT_CONFIG_TEMPLATE)
+        except FileExistsError:
+            pass
+        except OSError:
+            LOGGER.exception('Unable to create default config at %s', CONFIG_FILE)
+
     if os.path.exists(CONFIG_FILE):
         CONFIG.read(CONFIG_FILE)
-    # else:
-        # # write config file down if not existing:
-        # root_dir = os.path.dirname(CONFIG_FILE)
-        # if not os.path.exists(root_dir):
-            # os.makedirs(root_dir)
-        # with open(CONFIG_FILE, 'w') as f:
-            # CONFIG.write(f)
 
 
 def grab_screen(i):
@@ -333,8 +385,13 @@ def wait_for_workspace(i3conn, name, timeout=1.5):
     return None
 
 
-def capture_missing_workspace_previews(i3conn, workspace_keys):
-    """Visit unseen, non-empty workspaces once and cache their screenshots.
+def capture_missing_workspace_previews(
+    i3conn,
+    workspace_keys,
+    capture_delay=0.2,
+    force=False,
+):
+    """Visit non-empty workspaces and cache missing or forced screenshots.
 
     X11 cannot capture an i3 workspace which has never been mapped.  The sweep
     therefore switches only to live workspaces that have windows and no cached
@@ -356,7 +413,10 @@ def capture_missing_workspace_previews(i3conn, workspace_keys):
             workspace_key(ws) in requested
             and workspace_key(ws) != workspace_key(original_ws)
             and ws.leaves()
-            and not GLOBAL_KNOWLEDGE['wss'][workspace_key(ws)]['screenshot']
+            and (
+                force
+                or not GLOBAL_KNOWLEDGE['wss'][workspace_key(ws)]['screenshot']
+            )
         )
     ]
     if not targets:
@@ -382,7 +442,7 @@ def capture_missing_workspace_previews(i3conn, workspace_keys):
                     continue
 
                 # Give applications one normal frame to repaint after mapping.
-                time.sleep(0.2)
+                time.sleep(max(0.0, capture_delay))
                 tree, focused_con, focused_ws = (
                     wait_for_workspace(i3conn, name) or focused
                 )
@@ -687,19 +747,23 @@ def process_img(shot):
 
 def get_font(name, size):
     """Load a requested system font without pygame's noisy fallback warning."""
+    if not name or name.strip().lower() in ('default', 'pygame'):
+        return pygame.font.Font(None, size)
     font_path = pygame.font.match_font(name) if name else None
     return pygame.font.Font(font_path, size) if font_path else pygame.font.Font(None, size)
 
 
 def draw_missing_tile(screen_w, screen_h):
-    key = '{}x{}'.format(screen_w, screen_h)
+    font_name = CONFIG.get('CONF', 'names_font')
+    color = CONFIG.getcolor('CONF', 'names_color')
+    key = '{}x{}-{}-{}'.format(screen_w, screen_h, font_name, color)
 
     if key in qm_cache:
         return qm_cache[key]
 
     missing_tile = pygame.Surface((screen_w, screen_h), pygame.SRCALPHA, 32)
     missing_tile = missing_tile.convert_alpha()
-    qm = get_font('sans-serif', max(12, screen_h)).render('?', True, (150, 150, 150))
+    qm = get_font(font_name, max(12, screen_h)).render('?', True, color)
     qm_size = qm.get_rect().size
     origin_x = round((screen_w - qm_size[0])/2)
     origin_y = round((screen_h - qm_size[1])/2)
@@ -852,6 +916,19 @@ def resolve_grid_layout(screen_w, screen_h, wss) -> list[int]:
     return grid
 
 
+def direct_workspace_command(key, tiles):
+    """Return an i3 command when a typed key exactly names a workspace."""
+    if len(key) != 1:
+        return None
+    for tile in tiles.values():
+        name = str(GLOBAL_KNOWLEDGE['wss'][tile['ws']]['name'])
+        if name == key:
+            return 'workspace --no-auto-back-and-forth {}'.format(
+                quote_i3_string(name)
+            )
+    return None
+
+
 # return of not-None means we should focus the
 # previously-focused window upon the closure of expo UI
 #
@@ -877,6 +954,9 @@ def input_event_loop(screen, tiles, active_tile, grid, wss):
             elif event.type == pygame.MOUSEMOTION:
                 is_mouse_input = True
             elif event.type == pygame.KEYDOWN:
+                command = direct_workspace_command(event.unicode, tiles)
+                if command is not None:
+                    return command
                 if event.key == pygame.K_UP or event.key == pygame.K_k:
                     kbdmove = (0, -1)
                 elif event.key == pygame.K_DOWN or event.key == pygame.K_j:
@@ -937,7 +1017,9 @@ def input_event_loop(screen, tiles, active_tile, grid, wss):
 
         if jump and active_tile is not None:
             target_ws_num = tiles[active_tile]['ws']
-            return 'workspace ' + str(GLOBAL_KNOWLEDGE['wss'][target_ws_num]['name'])
+            return 'workspace --no-auto-back-and-forth {}'.format(
+                quote_i3_string(GLOBAL_KNOWLEDGE['wss'][target_ws_num]['name'])
+            )
 
         draw_tile_overlays(screen, active_tile, tiles)
 
@@ -1073,6 +1155,137 @@ def on_win_title(i3, e):
         UPDATER_DEBOUNCED(i3, e)
 
 
+SHORTCUT_MODIFIER_MASKS = {
+    'shift': 1,
+    'control': 4,
+    'ctrl': 4,
+    'alt': 8,
+    'mod1': 8,
+    'super': 64,
+    'win': 64,
+    'mod4': 64,
+}
+
+
+def parse_global_shortcut(shortcut):
+    """Parse ``Mod4+e``-style shortcut text into an X11 mask and keysym."""
+    shortcut = shortcut.strip()
+    if not shortcut:
+        return None
+
+    modifiers = 0
+    keys = []
+    for part in (item.strip() for item in shortcut.split('+')):
+        normalized = part.lower()
+        if normalized in SHORTCUT_MODIFIER_MASKS:
+            modifiers |= SHORTCUT_MODIFIER_MASKS[normalized]
+        elif part:
+            keys.append(part)
+
+    if len(keys) != 1:
+        raise ValueError('shortcut must contain exactly one non-modifier key')
+
+    key = keys[0]
+    aliases = {
+        'enter': 'Return',
+        'return': 'Return',
+        'esc': 'Escape',
+        'escape': 'Escape',
+        'space': 'space',
+        'tab': 'Tab',
+    }
+    key = aliases.get(key.lower(), key)
+    if len(key) == 1:
+        key = key.lower()
+    elif key.lower().startswith('f') and key[1:].isdigit():
+        key = key.upper()
+    return modifiers, key
+
+
+def global_shortcut_listener(shortcut):
+    """Grab a configurable X11 key and relay it through the normal signal path."""
+    try:
+        parsed = parse_global_shortcut(shortcut)
+        if parsed is None:
+            return
+        modifiers, key_name = parsed
+    except ValueError:
+        LOGGER.exception('Invalid global shortcut %s', shortcut)
+        return
+
+    try:
+        from Xlib import X, XK, display, error
+    except ImportError:
+        LOGGER.exception('python-xlib is required for global shortcut support')
+        return
+
+    try:
+        xdisplay = display.Display()
+        root = xdisplay.screen().root
+        keysym = XK.string_to_keysym(key_name)
+        keycode = xdisplay.keysym_to_keycode(keysym) if keysym else 0
+        if not keycode:
+            raise ValueError('unknown X11 key: {}'.format(key_name))
+
+        # Also work while Caps Lock and the common Num Lock modifier are active.
+        ignored_masks = (0, X.LockMask, X.Mod2Mask, X.LockMask | X.Mod2Mask)
+        grab_errors = []
+        for ignored in ignored_masks:
+            catch_error = error.CatchError(error.BadAccess)
+            root.grab_key(
+                keycode,
+                modifiers | ignored,
+                False,
+                X.GrabModeAsync,
+                X.GrabModeAsync,
+                onerror=catch_error,
+            )
+            grab_errors.append(catch_error)
+        xdisplay.sync()
+        if any(catch_error.get_error() for catch_error in grab_errors):
+            xdisplay.close()
+            LOGGER.error(
+                'Global shortcut %s is already used; change toggle_shortcut in %s',
+                shortcut,
+                CONFIG_FILE,
+            )
+            return
+        LOGGER.info('Global shortcut enabled: %s', shortcut)
+
+        last_toggle = 0.0
+        while True:
+            event = xdisplay.next_event()
+            if event.type != X.KeyPress or event.detail != keycode:
+                continue
+            now = time.monotonic()
+            if now - last_toggle < 0.35:
+                continue
+            last_toggle = now
+            os.kill(os.getpid(), signal.SIGUSR1)
+    except Exception:
+        LOGGER.exception('Unable to enable global shortcut %s', shortcut)
+
+
+def start_global_shortcut_listener(shortcut):
+    global SHORTCUT_THREAD
+
+    try:
+        parsed = parse_global_shortcut(shortcut)
+    except ValueError:
+        LOGGER.exception('Invalid global shortcut %s', shortcut)
+        return None
+    if parsed is None:
+        return None
+    SHORTCUT_THREAD = Thread(
+        target=global_shortcut_listener,
+        args=(shortcut,),
+        name='i3expo-shortcut',
+        daemon=True,
+    )
+    SHORTCUT_THREAD.start()
+    return SHORTCUT_THREAD
+
+
 def run():
     global i3
     global CONFIG
@@ -1099,7 +1312,15 @@ def run():
     signal.signal(signal.SIGHUP, signal_reload)
     signal.signal(signal.SIGUSR1, signal_toggle_ui)
 
-    update_state(i3, all_active_ws=True)
+    if CONFIG.getboolean('CONF', 'startup_scan'):
+        capture_missing_workspace_previews(
+            i3,
+            shown_ws(),
+            CONFIG.getfloat('CONF', 'workspace_capture_delay_sec'),
+            force=True,
+        )
+    update_state(i3, all_active_ws=True, force=True)
+    start_global_shortcut_listener(CONFIG.get('CONF', 'toggle_shortcut'))
 
     # i3.on('window::new', update_state)  # no need when changing on window::focus
     # i3.on('window::close', update_state)  # no need when changing on window::focus

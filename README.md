@@ -35,21 +35,27 @@ pipx install i3expo
 Launch i3expo from i3 config; alternatively you may prefer to run `i3expo` in a
 terminal in order to catch any errors in this pre-alpha stage.
 
-Default configuration is written into `$XDG_CONFIG_HOME/i3expo/config`. Color values
-can be specified by using their PyGame names or in #fff or #ffffff hex.
+On first run, i3expo creates `$XDG_CONFIG_HOME/i3expo/config` (normally
+`~/.config/i3expo/config`). It contains the complete editable theme, startup scan,
+and global shortcut settings. Existing configuration files are never overwritten.
+Color values can use PyGame names, `#fff`, or `#ffffff` hex.
 
 Send `SIGUSR1` to `i3expo` to toggle the Expo UI, for example by adding a `bindsym`
 for `killall -s SIGUSR1 i3expo` to your i3 config. Send `SIGHUP` to have the
 application reload its configuration.
 
-Navigate the UI with the mouse or with they keyboard using `hjkl`, the arrow keys,
-Return and Escape.
+The default global shortcut is `Mod4+e`; edit `toggle_shortcut` and restart i3expo
+to change it, or leave it empty and use an i3 `bindsym`. Navigate the UI with the
+mouse, arrow keys, Return, and Escape. Typing a one-character workspace name jumps
+to it directly (`1` selects workspace `1`, `a` selects workspace `a`). The `hjkl`
+keys navigate only when a workspace with that exact one-character name is absent.
 
 Recommended i3 config:
 
 ```
   exec_always --no-startup-id i3expo
   for_window [class="^i3expo$"] fullscreen enable
+  # Optional when toggle_shortcut is empty:
   bindsym $mod1+e exec --no-startup-id killall -s SIGUSR1 i3expo
 ```
 
@@ -60,10 +66,10 @@ to the compiled prtscn executable.
 
 ## Limitations
 
-Since it works by taking screenshots, the application cannot know workspaces it
-hasn't seen yet. Furthermore, the updates are less continuous than you might be used
-to if you're coming from a compositing WM where they can happen live and in the
-background.
+Since it works by taking screenshots, X11 cannot provide an image for a workspace
+which has never been mapped. The default startup scan briefly maps each non-empty
+workspace, refreshes its preview, and restores the original window focus. This scan
+is automatic but cannot be completely invisible on a non-compositing window manager.
 
 ## Caution
 
