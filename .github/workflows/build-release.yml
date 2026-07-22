@@ -11,8 +11,8 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  APPIMAGE_NAME: i3expo-v0.0.8-dev0-appimage.3-x86_64.AppImage
-  RELEASE_TAG: v0.0.8-dev0-appimage.3
+  APPIMAGE_NAME: i3expo.AppImage
+  RELEASE_TAG: stable
 
 jobs:
   build-appimage:
@@ -135,7 +135,7 @@ jobs:
           Icon=i3expo
           Terminal=false
           Categories=Utility;System;
-          X-AppImage-Version=0.0.8
+          X-AppImage-Version=stable
           DESKTOP
           cp AppDir/i3expo.desktop AppDir/usr/share/applications/i3expo.desktop
 
@@ -178,8 +178,8 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          RELEASE_TITLE="i3expo AppImage 0.0.8.dev0 appimage.3"
-          RELEASE_NOTES="Standalone x86_64 AppImage for i3/X11. Named workspaces are keyed directly by name, workspace order is preserved, cached previews survive graceful restarts, the active preview refreshes before opening, missing fonts use a warning-free fallback, and the overview window is borderless. This workflow runs only when started manually."
+          RELEASE_TITLE="i3expo Stable"
+          RELEASE_NOTES="Stable x86_64 AppImage for i3/X11. Includes named workspace handling, preserved workspace order, persistent preview caching, active preview refresh, a warning-free font fallback, and a borderless overview window. This workflow runs only when started manually."
 
           if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
             gh release upload "$RELEASE_TAG" \
