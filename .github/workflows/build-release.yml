@@ -182,7 +182,7 @@ jobs:
         run: |
           set -euo pipefail
           RELEASE_TITLE="i3expo Stable"
-          RELEASE_NOTES="Stable x86_64 AppImage for i3/X11. Includes direct workspace keys, an editable first-run config and cyberpunk default theme, a configurable global shortcut, automatic startup capture for unseen non-empty workspaces, named workspace handling, persistent preview caching, and a borderless overview window. This workflow runs only when started manually."
+          RELEASE_NOTES="Stable x86_64 AppImage for i3/X11. Includes direct workspace keys, a fully annotated Chinese-English first-run config and cyberpunk default theme, a configurable global shortcut, automatic startup capture for unseen non-empty workspaces, named workspace handling, persistent preview caching, and a borderless overview window. This workflow runs only when started manually."
 
           if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
             gh release upload "$RELEASE_TAG" \

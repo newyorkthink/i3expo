@@ -215,6 +215,44 @@ def test_first_run_creates_editable_default_config(tmp_path, monkeypatch):
     assert 'toggle_shortcut = Mod4+e' in text
     assert config.get('CONF', 'bgcolor') == '#0A001F'
 
+    lines = text.splitlines()
+    documented_keys = (
+        'bgcolor',
+        'frame_active_color',
+        'frame_inactive_color',
+        'frame_missing_color',
+        'tile_missing_color',
+        'padding_percent_x',
+        'padding_percent_y',
+        'spacing_percent_x',
+        'spacing_percent_y',
+        'frame_width_px',
+        'names_show',
+        'names_font',
+        'names_fontsize',
+        'names_color',
+        'highlight_percentage',
+        'forced_update_interval_sec',
+        'debounce_period_sec',
+        'output_blacklist',
+        'win_class_blacklist',
+        'startup_scan',
+        'workspace_capture_delay_sec',
+        'toggle_shortcut',
+        'store_state_on_restart',
+        'max_persisted_state_age_sec',
+        'log_lvl',
+    )
+    for key in documented_keys:
+        index = next(
+            index for index, line in enumerate(lines)
+            if line.startswith(key + ' =')
+        )
+        comment = lines[index - 1]
+        assert comment.startswith('# '), key
+        assert any('\u4e00' <= char <= '\u9fff' for char in comment), key
+        assert any('a' <= char.lower() <= 'z' for char in comment), key
+
 
 def test_existing_config_is_not_overwritten(tmp_path, monkeypatch):
     config_path = tmp_path / 'i3expo' / 'config'
@@ -229,6 +267,25 @@ def test_existing_config_is_not_overwritten(tmp_path, monkeypatch):
 
     assert config_path.read_text(encoding='utf-8') == custom
     assert config.get('CONF', 'bgcolor') == '#123456'
+
+
+def test_unedited_legacy_default_config_is_upgraded(tmp_path, monkeypatch):
+    config_path = tmp_path / 'i3expo' / 'config'
+    config_path.parent.mkdir()
+    legacy = '# old generated template\n[CONF]\nbgcolor = #0A001F\n'
+    config_path.write_text(legacy, encoding='utf-8')
+    legacy_hash = main.hashlib.sha256(legacy.encode('utf-8')).hexdigest()
+    config = configparser.ConfigParser(converters={'color': main.get_color})
+    monkeypatch.setattr(main, 'CONFIG', config, raising=False)
+    monkeypatch.setattr(main, 'CONFIG_FILE', str(config_path), raising=False)
+    monkeypatch.setattr(main, 'LEGACY_DEFAULT_CONFIG_SHA256', legacy_hash)
+
+    main.read_config()
+
+    upgraded = config_path.read_text(encoding='utf-8')
+    assert upgraded.startswith('# i3expo 用户配置 / User configuration\n')
+    assert '日志级别' in upgraded
+    assert 'Log level' in upgraded
 
 
 def test_rename_preserves_workspace_order_and_active_key():

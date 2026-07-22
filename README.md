@@ -37,8 +37,9 @@ terminal in order to catch any errors in this pre-alpha stage.
 
 On first run, i3expo creates `$XDG_CONFIG_HOME/i3expo/config` (normally
 `~/.config/i3expo/config`). It contains the complete editable theme, startup scan,
-and global shortcut settings. Existing configuration files are never overwritten.
-Color values can use PyGame names, `#fff`, or `#ffffff` hex.
+and global shortcut settings, with Chinese-English comments for every option.
+Existing configuration files are never overwritten. Color values can use PyGame
+names, `#fff`, or `#ffffff` hex.
 
 Send `SIGUSR1` to `i3expo` to toggle the Expo UI, for example by adding a `bindsym`
 for `killall -s SIGUSR1 i3expo` to your i3 config. Send `SIGHUP` to have the
