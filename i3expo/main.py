@@ -12,6 +12,7 @@ import os
 import sys
 import configparser
 os.environ['PYGAME_HIDE_SUPPORT_PROMPT'] = '1'  # needs to be set prior to importing pygame; see https://github.com/pygame/pygame/issues/1468
+os.environ.setdefault('SDL_VIDEO_X11_WMCLASS', 'i3expo')
 import pygame
 import i3ipc
 import copy
@@ -21,6 +22,8 @@ import pprint
 import time
 import math
 import logging
+import tempfile
+import warnings
 from .debounce import Debounce
 from functools import partial
 from threading import Thread
@@ -41,7 +44,7 @@ pp = pprint.PrettyPrinter(indent=4)
 GLOBAL_UPDATES_RUNNING = True  # if false, we don't grab any screenshots/update internal state
 
 qm_cache = {}  # screen_w x screen_h mapped against rendered question mark for missing tiles
-LOCK = singleton.SingleInstance()
+LOCK = None
 LOGGER = logging.getLogger(__name__)
 
 
@@ -49,11 +52,26 @@ LOGGER = logging.getLogger(__name__)
     # return  xdg.BaseDirectory.get_runtime_dir()
 
 def _runtime_path() -> str:
-    xdg_dir = os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
-    dir_path = xdg_dir + "/i3expo"
-    if not os.path.isdir(dir_path):
-        os.makedirs(dir_path)
-    return dir_path
+    uid = os.getuid()
+    runtime_roots = [
+        os.environ.get('XDG_RUNTIME_DIR'),
+        f'/run/user/{uid}',
+        tempfile.gettempdir(),
+    ]
+
+    for root in runtime_roots:
+        if not root:
+            continue
+        dirname = 'i3expo' if root != tempfile.gettempdir() else f'i3expo-{uid}'
+        dir_path = os.path.join(root, dirname)
+        try:
+            os.makedirs(dir_path, mode=0o700, exist_ok=True)
+            if os.access(dir_path, os.W_OK | os.X_OK):
+                return dir_path
+        except OSError:
+            continue
+
+    raise RuntimeError('Unable to create a writable i3expo runtime directory')
 
 RUNTIME_PATH = _runtime_path()
 
@@ -63,10 +81,19 @@ def shutdown_common():
     LOGGER.info('Shutting down...')
 
     try:
+        if (
+            'GLOBAL_KNOWLEDGE' in globals()
+            and 'CONFIG' in globals()
+            and CONFIG.getboolean('CONF', 'store_state_on_restart')
+        ):
+            persist_state()
         GLOBAL_UPDATES_RUNNING = False
-        UPDATER_DEBOUNCED.reset()
-        WS_UPDATE_DEBOUNCED.reset()
-        i3.main_quit()
+        if 'UPDATER_DEBOUNCED' in globals():
+            UPDATER_DEBOUNCED.reset()
+        if 'WS_UPDATE_DEBOUNCED' in globals():
+            WS_UPDATE_DEBOUNCED.reset()
+        if 'i3' in globals():
+            i3.main_quit()
 
         pygame.display.quit()
         pygame.quit()
@@ -83,7 +110,7 @@ def signal_quit(signal, stack_frame):
 
 
 def load_global_knowledge() -> dict:
-    default = {'active': -1,  # 'active' = currently active ws num
+    default = {'active': None,  # currently active workspace name
                'prev_f_w': None,
                'wss': {}
               }
@@ -98,7 +125,18 @@ def load_global_knowledge() -> dict:
             t = s.get('timestamp', 0)
 
             if (_unix_time_now() - t <= CONFIG.getint('CONF', 'max_persisted_state_age_sec')):
-                return s.get('gknowledge', default)
+                loaded = s.get('gknowledge', default)
+                normalized = default.copy()
+                normalized['prev_f_w'] = loaded.get('prev_f_w')
+
+                # State written by releases before appimage.3 used workspace
+                # numbers as keys. Re-key by the stored name so old state can
+                # be migrated without collapsing every named workspace at -1.
+                for item in loaded.get('wss', {}).values():
+                    name = item.get('name')
+                    if name:
+                        normalized['wss'][str(name)] = item
+                return normalized
     except Exception as e:
         LOGGER.error(e)
     return default
@@ -111,7 +149,7 @@ def persist_state():
 
     try:
         # pp.pprint(GLOBAL_KNOWLEDGE)
-        for k, v in GLOBAL_KNOWLEDGE['wss'].items():
+        for v in GLOBAL_KNOWLEDGE['wss'].values():
             i = v['screenshot']
             # in order to pickle ctypes data, convert it into bytearray:
             if i:
@@ -133,8 +171,6 @@ def _unix_time_now() -> int:
 
 
 def on_shutdown(i3conn, e):
-    if e.change == 'restart' and CONFIG.getboolean('CONF', 'store_state_on_restart'):
-        persist_state()
     shutdown_common()
 
 
@@ -186,6 +222,10 @@ def signal_toggle_ui(signal, stack_frame):
 
     wss = shown_ws()
     if len(wss) > 1:  # i.e. should show UI
+        # Refresh the visible workspace immediately before drawing the grid.
+        # Other workspaces use the last screenshot captured while they were
+        # visible, which is the only reliable method on non-compositing i3/X11.
+        update_state(i3, force=True)
         # i3.command('workspace i3expo-temporary-workspace')  # jump to temp ws; doesn't seem to work well in multimon setup; introduced by  https://gitlab.com/d.reis/i3expo/-/commit/d14685d16fd140b3a7374887ca086ea66e0388f5 - looks like it solves problem where fullscreen state is lost on expo toggle
         GLOBAL_UPDATES_RUNNING = False
         UPDATER_DEBOUNCED.reset()
@@ -195,9 +235,9 @@ def signal_toggle_ui(signal, stack_frame):
         # ui_thread.daemon = True
         try:
             show_ui(wss)
-        except Exception as e:
-            # LOGGER.error(e)
-            pass
+        except Exception:
+            LOGGER.exception('Unable to display workspace overview')
+            GLOBAL_UPDATES_RUNNING = True
 
 
 def get_color(raw):
@@ -231,7 +271,7 @@ def read_config():
             'highlight_percentage'       : 20,
             'screenshot_lib_path'        : os.path.join(os.path.dirname(os.path.realpath(__file__)), 'prtscn.so'),
             'store_state_on_restart'     : True,
-            'max_persisted_state_age_sec': 2,
+            'max_persisted_state_age_sec': 604800,
             'state_f'                    : f'{RUNTIME_PATH}/{SELF_WIN_CLASS}.state',
             'log_lvl'                    : 'INFO'
         }
@@ -258,12 +298,23 @@ def grab_screen(i):
     return [w, h, result]
 
 
+def workspace_key(ws) -> str:
+    """Return the only collision-free i3 workspace identifier.
+
+    i3 reports ``num == -1`` for every workspace whose name does not begin
+    with a number, so ``ws.num`` cannot be used as a dictionary key.
+    """
+    return str(ws.name)
+
+
 def update_workspace(ws, focused_ws, hydration=False) -> dict:
-    i = GLOBAL_KNOWLEDGE['wss'].get(ws.num)
+    key = workspace_key(ws)
+    i = GLOBAL_KNOWLEDGE['wss'].get(key)
     if i is None:
-        i = GLOBAL_KNOWLEDGE['wss'][ws.num] = {
+        i = GLOBAL_KNOWLEDGE['wss'][key] = {
             'op'          : ws.ipc_data['output'],
             'name'        : ws.name,
+            'num'         : ws.num,
             'id'          : ws.id,
             'screenshot'  : [],    # array of [w,h,byte-array representation of this ws screenshot]
             'last-update' : 0.0,   # unix epoch when ws was last grabbed
@@ -277,24 +328,27 @@ def update_workspace(ws, focused_ws, hydration=False) -> dict:
             'ff'          : None   # float-focus; ID of a floating window to focus when we return to this WS
         }
 
-    # some data should not be set on first state hydration, e.g. missing polybar
-    # on initial restart causes different w & h values than our loaded data,
-    # causing error on render
-    if hydration:
-        i['id'] = ws.id
-        i['name'] = ws.name
-        #i['op'] = ws.ipc_data['output']
-    else:
-        # always update dimensions; eg ws might've been moved onto a different output:
-        i['x'] = ws.rect.x
-        i['y'] = ws.rect.y
-        i['w'] = ws.rect.width
-        i['h'] = ws.rect.height
-        i['ratio'] = ws.rect.width / ws.rect.height
+    current_size = (ws.rect.width, ws.rect.height)
+    stored_size = (i.get('w', 0), i.get('h', 0))
+    if hydration and i.get('screenshot') and stored_size != current_size:
+        # A cached image with old output dimensions cannot be rendered safely.
+        i['screenshot'] = []
+        i['last-update'] = 0.0
+
+    # Always refresh live metadata; screenshots are retained only when their
+    # dimensions still match the current output.
+    i['op'] = ws.ipc_data['output']
+    i['name'] = ws.name
+    i['num'] = ws.num
+    i['id'] = ws.id
+    i['x'] = ws.rect.x
+    i['y'] = ws.rect.y
+    i['w'] = ws.rect.width
+    i['h'] = ws.rect.height
+    i['ratio'] = ws.rect.width / ws.rect.height if ws.rect.height else 1.0
 
     if ws.id == focused_ws.id:
-        # LOGGER.debug('active WS:: {}'.format(ws.name))
-        GLOBAL_KNOWLEDGE['active'] = ws.num
+        GLOBAL_KNOWLEDGE['active'] = key
     return i
 
 
@@ -302,7 +356,7 @@ def init_knowledge():
     global GLOBAL_KNOWLEDGE
 
     GLOBAL_KNOWLEDGE = load_global_knowledge()
-    state_hydration = GLOBAL_KNOWLEDGE['active'] != -1
+    state_hydration = bool(GLOBAL_KNOWLEDGE['wss'])
 
     tree = i3.get_tree()
     focused_ws = tree.find_focused().workspace()
@@ -339,7 +393,7 @@ def update_tree_state(ws, wk):
 
 
 def should_update_ws(rate_limit_period, ws, wk, t, force):
-    if rate_limit_period is not None and t - wk['last-update'] <= rate_limit_period:
+    if not force and rate_limit_period is not None and t - wk['last-update'] <= rate_limit_period:
         return False
     return update_tree_state(ws, wk) or force
 
@@ -379,7 +433,7 @@ def update_state(i3, e=None, rate_limit_period=None,
         if should_update_ws(rate_limit_period, ws, wk, t0, force):
             t1 = time.time()
             wk['screenshot'] = grab_screen(wk)
-            LOGGER.debug('  -> grabbing WS {} image took {}'.format(ws.num, time.time()-t1))
+            LOGGER.debug('  -> grabbing WS {} image took {}'.format(ws.name, time.time()-t1))
             wk['last-update'] = t0
 
     # } ...or new py-bindings: {  # this seems to be slower, for whatever the reason
@@ -430,13 +484,21 @@ def show_ui(wss):
 
     ws = GLOBAL_KNOWLEDGE['wss'][GLOBAL_KNOWLEDGE['active']]
 
-    screen = pygame.display.set_mode((ws['w'], ws['h']), pygame.RESIZABLE)
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            'ignore',
+            message='Requested window was forcibly resized by the OS.*',
+            category=RuntimeWarning,
+        )
+        screen = pygame.display.set_mode(
+            (ws['w'], ws['h']),
+            pygame.RESIZABLE | pygame.NOFRAME,
+        )
     pygame.display.set_caption(SELF_WIN_CLASS)
 
     tiles = {}  # contains grid tile index to thumbnail/ws_screenshot data mappings
     active_tile = None
 
-    wss.sort()
     wss2 = list(wss)  # shallow copy
 
     grid_layout = resolve_grid_layout(ws['w'], ws['h'], wss2)
@@ -459,7 +521,7 @@ def show_ui(wss):
                 'ul'        : (-1, -1),  # upper-left coords (including frame/border);
                 'br'        : (-1, -1),  # bottom-right coords (including frame/border);
                 'row_idx'   : row_idx,
-                'ws'        : ws_num,        # workspace.num this tile represents;
+                'ws'        : ws_num,        # workspace-name key represented by this tile;
                 'frame_col' : None,
                 'tile_col'  : None,
                 'img'       : None  # processed, ie pygame-ready thumbnail;
@@ -506,6 +568,12 @@ def process_img(shot):
     return pygame.image.frombuffer(pil.tobytes(), pil.size, pil.mode)  # frombuffer() potentially faster than .fromstring()
 
 
+def get_font(name, size):
+    """Load a requested system font without pygame's noisy fallback warning."""
+    font_path = pygame.font.match_font(name) if name else None
+    return pygame.font.Font(font_path, size) if font_path else pygame.font.Font(None, size)
+
+
 def draw_missing_tile(screen_w, screen_h):
     key = '{}x{}'.format(screen_w, screen_h)
 
@@ -514,7 +582,7 @@ def draw_missing_tile(screen_w, screen_h):
 
     missing_tile = pygame.Surface((screen_w, screen_h), pygame.SRCALPHA, 32)
     missing_tile = missing_tile.convert_alpha()
-    qm = pygame.font.SysFont('sans-serif', screen_h).render('?', True, (150, 150, 150))
+    qm = get_font('sans-serif', max(12, screen_h)).render('?', True, (150, 150, 150))
     qm_size = qm.get_rect().size
     origin_x = round((screen_w - qm_size[0])/2)
     origin_y = round((screen_h - qm_size[1])/2)
@@ -556,7 +624,7 @@ def render_workspace_name(tile, screen, origin_x, origin_y, tile_w, tile_h):
     names_color = CONFIG.getcolor('CONF', 'names_color')
     names_font = CONFIG.get('CONF', 'names_font')
     names_fontsize = CONFIG.getint('CONF', 'names_fontsize')
-    font = pygame.font.SysFont(names_font, names_fontsize)
+    font = get_font(names_font, names_fontsize)
 
     name = font.render(name, True, names_color)
     name_width = name.get_rect().size[0]
@@ -791,13 +859,10 @@ def draw_tile_overlays(screen, active_tile, tiles):
 def on_ws(i3, e):
     global GLOBAL_UPDATES_RUNNING
 
-    LOGGER.debug(' ---- on ws state: {}, num: {}'.format(e.change, e.current.num))
-    gk = GLOBAL_KNOWLEDGE['wss']
-    if e.current.num in gk:
-        gk = gk[e.current.num]
-        gk['op'] = e.current.ipc_data['output']
-    else:
-        gk = None
+    LOGGER.debug(' ---- on ws state: {}, name: {}'.format(e.change, e.current.name))
+    tree = i3.get_tree()
+    focused_ws = tree.find_focused().workspace()
+    gk = update_workspace(e.current, focused_ws)
 
     if not GLOBAL_UPDATES_RUNNING:
         # this block gets executed if we exit expo by moving focus to other WS, ie. not by toggling WS change via expo itself
@@ -814,11 +879,12 @@ def on_ws(i3, e):
         # at focus[1] as i3expo window will be listed in container ID-d by focus[0]
         #
         # (note [e.old is not None] implies change='focus')
-        if e.old is not None and e.old.num in GLOBAL_KNOWLEDGE['wss'] and len(e.old.focus) > 1:  # TODO schedule focus events when returning to ws??? sounds like hacky & loads of corner cases
-            win = i3.get_tree().find_by_id(e.old.focus[1])
-            if win.type == 'floating_con' and win.focus:
-                GLOBAL_KNOWLEDGE['wss'][e.old.num]['ff'] = win.focus[0]
-    elif gk is not None and gk['ff'] is not None and e.change == 'focus':
+        old_key = workspace_key(e.old) if e.old is not None else None
+        if old_key in GLOBAL_KNOWLEDGE['wss'] and len(e.old.focus) > 1:  # TODO schedule focus events when returning to ws??? sounds like hacky & loads of corner cases
+            win = tree.find_by_id(e.old.focus[1])
+            if win is not None and win.type == 'floating_con' and win.focus:
+                GLOBAL_KNOWLEDGE['wss'][old_key]['ff'] = win.focus[0]
+    elif gk['ff'] is not None and e.change == 'focus':
         i3.command('[con_id={}] focus'.format(gk['ff']))
         gk['ff'] = None  # reset
 
@@ -829,17 +895,35 @@ def on_ws(i3, e):
 def on_ws_empty(i3, e):
     LOGGER.debug(' ---- on ws EMPTY: {}'.format(e.change))
 
-    wspace_nums = [w.num for w in i3.get_tree().workspaces()]
-    deleted = [n for n in GLOBAL_KNOWLEDGE['wss'] if n not in wspace_nums]
-    for n in deleted:
-        del GLOBAL_KNOWLEDGE['wss'][n]
+    workspace_names = {workspace.name for workspace in i3.get_tree().workspaces()}
+    for name, item in GLOBAL_KNOWLEDGE['wss'].items():
+        if name not in workspace_names:
+            # Keep the workspace entry so fixed named workspace layouts remain
+            # visible and selectable, but do not display windows that were closed.
+            item['screenshot'] = []
+            item['last-update'] = 0.0
+            item['state'] = 0
 
 
 def on_ws_rename(i3, e):
     LOGGER.debug(' ---- on ws RENAME: {}'.format(e.change))
-    gk = GLOBAL_KNOWLEDGE['wss']
-    if e.current.num in gk:
-        gk[e.current.num]['name'] = e.current.name
+    old_name = e.old.name if e.old is not None else None
+    new_name = e.current.name
+    if not old_name or old_name not in GLOBAL_KNOWLEDGE['wss']:
+        return
+
+    renamed = {}
+    for name, item in GLOBAL_KNOWLEDGE['wss'].items():
+        if name == old_name:
+            item['name'] = new_name
+            item['num'] = e.current.num
+            renamed[new_name] = item
+        else:
+            renamed[name] = item
+    GLOBAL_KNOWLEDGE['wss'] = renamed
+
+    if GLOBAL_KNOWLEDGE['active'] == old_name:
+        GLOBAL_KNOWLEDGE['active'] = new_name
 
 
 # note we use the PREVIOUSLY_FOCUSED_WIN hack just because window event doesn't
@@ -870,7 +954,9 @@ def run():
     global CONFIG_FILE
     global UPDATER_DEBOUNCED
     global WS_UPDATE_DEBOUNCED
+    global LOCK
 
+    LOCK = singleton.SingleInstance()
     i3 = i3ipc.Connection()
 
     converters = {'color': get_color}

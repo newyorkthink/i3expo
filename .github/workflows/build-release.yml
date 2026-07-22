@@ -1,15 +1,6 @@
 name: Build AppImage Release
 
 on:
-  push:
-    branches:
-      - master
-    paths:
-      - "i3expo/**"
-      - "requirements.txt"
-      - "setup.py"
-      - "prtscn.c"
-      - ".github/workflows/build-release.yml"
   workflow_dispatch:
 
 permissions:
@@ -20,8 +11,8 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  APPIMAGE_NAME: i3expo-x86_64.AppImage
-  RELEASE_TAG: v0.0.8-dev0-appimage.2
+  APPIMAGE_NAME: i3expo-v0.0.8-dev0-appimage.3-x86_64.AppImage
+  RELEASE_TAG: v0.0.8-dev0-appimage.3
 
 jobs:
   build-appimage:
@@ -47,7 +38,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends build-essential libx11-dev file
           python -m pip install --upgrade pip setuptools wheel
-          python -m pip install . pyinstaller
+          python -m pip install . pyinstaller pytest
 
       - name: Rebuild X11 screenshot library
         shell: bash
@@ -69,22 +60,21 @@ jobs:
           import xdg
           from PIL import Image
           from tendo import singleton
-          from i3expo.appimage_fix import install
+          from i3expo.main import workspace_key
 
           print("Python dependency import check passed")
           PY
+          python -m pytest -q
 
       - name: Build standalone executable
         shell: bash
         run: |
           set -euo pipefail
           cat > appimage_entry.py <<'PY'
-          from i3expo import main as i3expo_main
-          from i3expo.appimage_fix import install
+          from i3expo import run
 
           if __name__ == "__main__":
-              install()
-              i3expo_main.run()
+              run()
           PY
 
           python -m PyInstaller \
@@ -188,8 +178,8 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          RELEASE_TITLE="i3expo AppImage 0.0.8.dev0 appimage.2"
-          RELEASE_NOTES="Standalone x86_64 AppImage for i3/X11. Fixes named workspaces such as a/k/p/b being collapsed into one entry and removes the missing sans-serif warning. Hidden workspaces receive a preview after they have been visited once while i3expo is running."
+          RELEASE_TITLE="i3expo AppImage 0.0.8.dev0 appimage.3"
+          RELEASE_NOTES="Standalone x86_64 AppImage for i3/X11. Named workspaces are keyed directly by name, workspace order is preserved, cached previews survive graceful restarts, the active preview refreshes before opening, missing fonts use a warning-free fallback, and the overview window is borderless. This workflow runs only when started manually."
 
           if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
             gh release upload "$RELEASE_TAG" \
