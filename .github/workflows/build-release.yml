@@ -1,11 +1,203 @@
-name: Build, test, release
+name: Build AppImage Release
 
-# note "create" event is just so our flows trigger on tag pushes that
-# are tagged with [ci skip], see https://github.com/orgs/community/discussions/179637
-on: [push, create]
+on:
+  push:
+    branches:
+      - master
+    paths:
+      - "i3expo/**"
+      - "requirements.txt"
+      - "setup.py"
+      - "prtscn.c"
+      - ".github/workflows/build-release.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: i3expo-appimage-release
+  cancel-in-progress: false
+
+env:
+  APPIMAGE_NAME: i3expo-x86_64.AppImage
+  RELEASE_TAG: v0.0.8-dev0-appimage.1
 
 jobs:
-  call-build:
-    uses: haridusministeerium/workflows/.github/workflows/py-build-publish-app.yml@master
-    secrets: inherit
+  build-appimage:
+    name: Build and publish AppImage
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
 
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install build dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends build-essential libx11-dev file
+          python -m pip install --upgrade pip setuptools wheel
+          python -m pip install . pyinstaller
+
+      - name: Rebuild X11 screenshot library
+        shell: bash
+        run: |
+          set -euo pipefail
+          gcc -shared -O3 -fPIC -Wl,-soname,prtscn -o i3expo/prtscn.so prtscn.c -lX11
+          file i3expo/prtscn.so
+          ldd i3expo/prtscn.so
+
+      - name: Validate Python source and dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m compileall -q i3expo
+          python - <<'PY'
+          import i3ipc
+          import pygame
+          import pulp
+          import xdg
+          from PIL import Image
+          from tendo import singleton
+
+          print("Python dependency import check passed")
+          PY
+
+      - name: Build standalone executable
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > appimage_entry.py <<'PY'
+          from i3expo import run
+
+          if __name__ == "__main__":
+              run()
+          PY
+
+          python -m PyInstaller \
+            --noconfirm \
+            --clean \
+            --onedir \
+            --console \
+            --name i3expo \
+            --collect-all pygame \
+            --collect-all pulp \
+            --collect-all PIL \
+            --collect-submodules i3ipc \
+            --collect-submodules xdg \
+            --collect-submodules tendo \
+            --copy-metadata pygame-ce \
+            --copy-metadata pulp \
+            --copy-metadata i3ipc \
+            --copy-metadata pyxdg \
+            --copy-metadata Pillow \
+            --copy-metadata tendo \
+            --add-data "i3expo/prtscn.so:i3expo" \
+            appimage_entry.py
+
+          test -x dist/i3expo/i3expo
+          test -n "$(find dist/i3expo -type f -name prtscn.so -print -quit)"
+          CBC_PATH="$(find dist/i3expo -type f -name cbc -print -quit)"
+          test -n "$CBC_PATH"
+          chmod +x "$CBC_PATH"
+          file dist/i3expo/i3expo
+
+      - name: Assemble AppDir
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf AppDir
+          mkdir -p \
+            AppDir/usr/bin \
+            AppDir/usr/lib/i3expo \
+            AppDir/usr/share/applications \
+            AppDir/usr/share/icons/hicolor/scalable/apps
+
+          cp -a dist/i3expo/. AppDir/usr/lib/i3expo/
+          ln -s ../lib/i3expo/i3expo AppDir/usr/bin/i3expo
+
+          cat > AppDir/AppRun <<'SH'
+          #!/bin/sh
+          HERE="$(dirname "$(readlink -f "$0")")"
+          exec "$HERE/usr/bin/i3expo" "$@"
+          SH
+          chmod +x AppDir/AppRun
+
+          cat > AppDir/i3expo.desktop <<'DESKTOP'
+          [Desktop Entry]
+          Type=Application
+          Name=i3expo
+          Comment=Visual overview of i3 workspaces
+          Exec=i3expo
+          Icon=i3expo
+          Terminal=false
+          Categories=Utility;System;
+          X-AppImage-Version=0.0.8
+          DESKTOP
+          cp AppDir/i3expo.desktop AppDir/usr/share/applications/i3expo.desktop
+
+          cat > AppDir/i3expo.svg <<'SVG'
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256">
+            <rect width="256" height="256" rx="42" fill="#20242b"/>
+            <rect x="30" y="36" width="86" height="76" rx="10" fill="#93afb3"/>
+            <rect x="140" y="36" width="86" height="76" rx="10" fill="#5a6da4"/>
+            <rect x="30" y="140" width="86" height="76" rx="10" fill="#5a6da4"/>
+            <rect x="140" y="140" width="86" height="76" rx="10" fill="#93afb3"/>
+            <rect x="22" y="28" width="102" height="92" rx="14" fill="none" stroke="#ffffff" stroke-width="8"/>
+          </svg>
+          SVG
+          cp AppDir/i3expo.svg AppDir/usr/share/icons/hicolor/scalable/apps/i3expo.svg
+          ln -s i3expo.svg AppDir/.DirIcon
+
+      - name: Build and validate AppImage
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fL \
+            https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage \
+            -o appimagetool-x86_64.AppImage
+          chmod +x appimagetool-x86_64.AppImage
+
+          ARCH=x86_64 APPIMAGE_EXTRACT_AND_RUN=1 \
+            ./appimagetool-x86_64.AppImage AppDir "$APPIMAGE_NAME"
+
+          chmod +x "$APPIMAGE_NAME"
+          file "$APPIMAGE_NAME"
+          "./$APPIMAGE_NAME" --appimage-extract >/dev/null
+          test -x squashfs-root/usr/lib/i3expo/i3expo
+          test -n "$(find squashfs-root -type f -name prtscn.so -print -quit)"
+          test -n "$(find squashfs-root -type f -name cbc -perm -u+x -print -quit)"
+          sha256sum "$APPIMAGE_NAME" > "$APPIMAGE_NAME.sha256"
+
+      - name: Publish GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          RELEASE_TITLE="i3expo AppImage 0.0.8.dev0"
+          RELEASE_NOTES="Standalone x86_64 AppImage for i3/X11. Python and application dependencies are bundled. The host system must provide i3, X11, and libX11."
+
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" \
+              "$APPIMAGE_NAME" \
+              "$APPIMAGE_NAME.sha256" \
+              --clobber
+          else
+            gh release create "$RELEASE_TAG" \
+              "$APPIMAGE_NAME" \
+              "$APPIMAGE_NAME.sha256" \
+              --target "$GITHUB_SHA" \
+              --title "$RELEASE_TITLE" \
+              --notes "$RELEASE_NOTES"
+          fi
