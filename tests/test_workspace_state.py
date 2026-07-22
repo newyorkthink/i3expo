@@ -192,6 +192,76 @@ def test_direct_key_selects_matching_workspace():
     assert main.direct_workspace_command('x', tiles) is None
 
 
+def test_only_arrow_keys_navigate_overview():
+    assert main.arrow_navigation_delta(main.pygame.K_UP) == (0, -1)
+    assert main.arrow_navigation_delta(main.pygame.K_DOWN) == (0, 1)
+    assert main.arrow_navigation_delta(main.pygame.K_LEFT) == (-1, 0)
+    assert main.arrow_navigation_delta(main.pygame.K_RIGHT) == (1, 0)
+    assert main.arrow_navigation_delta(main.pygame.K_h) is None
+    assert main.arrow_navigation_delta(main.pygame.K_j) is None
+    assert main.arrow_navigation_delta(main.pygame.K_k) is None
+    assert main.arrow_navigation_delta(main.pygame.K_l) is None
+
+
+def test_auto_capture_discovers_new_workspace_from_live_tree(monkeypatch):
+    reset_knowledge()
+    a = workspace('a', -1, 10, leaves=[object()])
+    i = workspace('i', -1, 20, leaves=[object()])
+    focused = SimpleNamespace(workspace=lambda: a)
+    tree = SimpleNamespace(
+        find_focused=lambda: focused,
+        workspaces=lambda: [a, i],
+    )
+    connection = SimpleNamespace(get_tree=lambda: tree)
+    config = configparser.ConfigParser()
+    config.read_dict({'CONF': {
+        'auto_scan_new_workspaces': 'true',
+        'workspace_capture_delay_sec': '0.2',
+    }})
+    calls = []
+
+    monkeypatch.setattr(main, 'CONFIG', config, raising=False)
+    monkeypatch.setattr(main, 'GLOBAL_UPDATES_RUNNING', True)
+    monkeypatch.setattr(main, 'PREVIEW_SWEEP_RUNNING', False)
+    monkeypatch.setattr(main, 'OUTPUT_BLACKLIST', [], raising=False)
+    monkeypatch.setattr(
+        main,
+        'capture_missing_workspace_previews',
+        lambda conn, keys, delay: calls.append((conn, keys, delay)),
+    )
+
+    main.auto_capture_missing_previews(connection)
+
+    assert list(main.GLOBAL_KNOWLEDGE['wss']) == ['a', 'i']
+    assert calls == [(connection, ['a', 'i'], 0.2)]
+
+
+def test_new_window_event_queues_normal_refresh_and_auto_scan(monkeypatch):
+    class Recorder:
+        def __init__(self):
+            self.calls = []
+
+        def __call__(self, *args):
+            self.calls.append(args)
+
+    normal_refresh = Recorder()
+    auto_scan = Recorder()
+    config = configparser.ConfigParser()
+    config.read_dict({'CONF': {'auto_scan_new_workspaces': 'true'}})
+    connection = object()
+    event = SimpleNamespace(change='new')
+
+    monkeypatch.setattr(main, 'CONFIG', config, raising=False)
+    monkeypatch.setattr(main, 'PREVIEW_SWEEP_RUNNING', False)
+    monkeypatch.setattr(main, 'UPDATER_DEBOUNCED', normal_refresh, raising=False)
+    monkeypatch.setattr(main, 'AUTO_SCAN_DEBOUNCED', auto_scan)
+
+    main.on_win_new_or_move(connection, event)
+
+    assert normal_refresh.calls == [(connection, event)]
+    assert auto_scan.calls == [(connection,)]
+
+
 def test_global_shortcut_parser():
     assert main.parse_global_shortcut('Mod4+e') == (64, 'e')
     assert main.parse_global_shortcut('Ctrl+Shift+space') == (5, 'space')
@@ -237,6 +307,8 @@ def test_first_run_creates_editable_default_config(tmp_path, monkeypatch):
         'output_blacklist',
         'win_class_blacklist',
         'startup_scan',
+        'auto_scan_new_workspaces',
+        'new_workspace_scan_delay_sec',
         'workspace_capture_delay_sec',
         'toggle_shortcut',
         'store_state_on_restart',
@@ -278,7 +350,7 @@ def test_unedited_legacy_default_config_is_upgraded(tmp_path, monkeypatch):
     config = configparser.ConfigParser(converters={'color': main.get_color})
     monkeypatch.setattr(main, 'CONFIG', config, raising=False)
     monkeypatch.setattr(main, 'CONFIG_FILE', str(config_path), raising=False)
-    monkeypatch.setattr(main, 'LEGACY_DEFAULT_CONFIG_SHA256', legacy_hash)
+    monkeypatch.setattr(main, 'LEGACY_DEFAULT_CONFIG_SHA256ES', {legacy_hash})
 
     main.read_config()
 

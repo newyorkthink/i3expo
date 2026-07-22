@@ -48,8 +48,9 @@ application reload its configuration.
 The default global shortcut is `Mod4+e`; edit `toggle_shortcut` and restart i3expo
 to change it, or leave it empty and use an i3 `bindsym`. Navigate the UI with the
 mouse, arrow keys, Return, and Escape. Typing a one-character workspace name jumps
-to it directly (`1` selects workspace `1`, `a` selects workspace `a`). The `hjkl`
-keys navigate only when a workspace with that exact one-character name is absent.
+to it directly (`1` selects workspace `1`, `a` selects workspace `a`). Navigation
+uses only the arrow keys, so workspace names such as `h`, `j`, `k`, and `l` never
+conflict with movement controls.
 
 Recommended i3 config:
 
@@ -71,6 +72,9 @@ Since it works by taking screenshots, X11 cannot provide an image for a workspac
 which has never been mapped. The default startup scan briefly maps each non-empty
 workspace, refreshes its preview, and restores the original window focus. This scan
 is automatic but cannot be completely invisible on a non-compositing window manager.
+New workspace and window events are also scanned automatically, with a periodic
+fallback in case an event is missed. Empty workspaces keep the question-mark
+placeholder until they contain a window that can be captured.
 
 ## Caution
 
