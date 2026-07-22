@@ -74,8 +74,10 @@ is open, `live_previews` keeps the overview as a sticky floating curtain, rotate
 same-output workspaces behind it, and uses XComposite window pixmaps to refresh the
 tiles. This allows video and other changing windows to update without exposing each
 workspace switch. `live_preview_interval_sec` controls the delay between refresh
-rounds. Empty workspaces keep the question-mark placeholder until they contain a
-window that can be captured.
+rounds. Sticky floating windows and the overview itself are excluded so one popup is
+not copied into every tile. When i3 destroys an empty workspace, its stale tile is
+removed; a currently existing workspace without a capturable window uses the
+question-mark placeholder.
 
 ## Caution
 

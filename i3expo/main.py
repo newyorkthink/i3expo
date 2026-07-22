@@ -40,6 +40,7 @@ from tendo import singleton
 from xdg.BaseDirectory import xdg_config_home
 
 SELF_WIN_CLASS = 'i3expo'
+PREVIEW_CACHE_VERSION = 2
 pp = pprint.PrettyPrinter(indent=4)
 
 GLOBAL_UPDATES_RUNNING = True  # if false, we don't grab any screenshots/update internal state
@@ -216,6 +217,9 @@ def load_global_knowledge() -> dict:
                 loaded = s.get('gknowledge', default)
                 normalized = default.copy()
                 normalized['prev_f_w'] = loaded.get('prev_f_w')
+                preview_cache_is_current = (
+                    s.get('preview_cache_version') == PREVIEW_CACHE_VERSION
+                )
 
                 # State written by releases before appimage.3 used workspace
                 # numbers as keys. Re-key by the stored name so old state can
@@ -223,6 +227,10 @@ def load_global_knowledge() -> dict:
                 for item in loaded.get('wss', {}).values():
                     name = item.get('name')
                     if name:
+                        if not preview_cache_is_current:
+                            item['screenshot'] = []
+                            item['last-update'] = 0.0
+                            item['state'] = 0
                         normalized['wss'][str(name)] = item
                 return normalized
     except Exception as e:
@@ -245,6 +253,7 @@ def persist_state():
 
         data = {
                 'timestamp':  _unix_time_now(),
+                'preview_cache_version': PREVIEW_CACHE_VERSION,
                 'gknowledge': GLOBAL_KNOWLEDGE
                }
 
@@ -573,7 +582,40 @@ def xcomposite_available():
                 pass
 
 
-def compose_workspace_preview(ws, previous, capture_window=grab_xcomposite_window):
+def is_live_preview_client(con, excluded_window_ids=None):
+    """Return whether a leaf belongs in a workspace's live preview."""
+    window_id = getattr(con, 'window', None)
+    if not window_id:
+        return False
+
+    excluded_window_ids = excluded_window_ids or set()
+    try:
+        if int(window_id) in excluded_window_ids:
+            return False
+    except (TypeError, ValueError):
+        return False
+
+    # Sticky state can live on the client or its floating parent in i3's tree.
+    # Such windows follow the overview across workspaces, so capturing them
+    # would stamp one notification, launcher, or overview into every tile.
+    ancestor = con
+    seen = set()
+    while ancestor is not None and id(ancestor) not in seen:
+        seen.add(id(ancestor))
+        if getattr(ancestor, 'sticky', False):
+            return False
+        ancestor = getattr(ancestor, 'parent', None)
+
+    window_class = str(getattr(con, 'window_class', '') or '')
+    return window_class.casefold() != SELF_WIN_CLASS.casefold()
+
+
+def compose_workspace_preview(
+    ws,
+    previous,
+    capture_window=grab_xcomposite_window,
+    excluded_window_ids=None,
+):
     """Overlay fresh client pixmaps on a cached full-workspace screenshot."""
     width = ws.rect.width
     height = ws.rect.height
@@ -594,9 +636,7 @@ def compose_workspace_preview(ws, previous, capture_window=grab_xcomposite_windo
 
     captured = 0
     for con in ws.leaves():
-        if not getattr(con, 'window', None):
-            continue
-        if getattr(con, 'window_class', None) == SELF_WIN_CLASS:
+        if not is_live_preview_client(con, excluded_window_ids):
             continue
         client = capture_window(con.window)
         if client is None:
@@ -847,8 +887,17 @@ def init_knowledge():
 
     tree = i3.get_tree()
     focused_ws = tree.find_focused().workspace()
+    live_workspaces = tree.workspaces()
+    live_keys = {workspace_key(ws) for ws in live_workspaces}
 
-    for ws in tree.workspaces():
+    # i3 destroys a workspace after its final window leaves. Do not resurrect
+    # persisted entries as permanent question-mark tiles on the next launch.
+    GLOBAL_KNOWLEDGE['wss'] = {
+        key: item for key, item in GLOBAL_KNOWLEDGE['wss'].items()
+        if key in live_keys
+    }
+
+    for ws in live_workspaces:
         # LOGGER.debug('workspaces() num {} name [{}], focused {}'.format(ws.num, ws.name, ws.focused))
         update_workspace(ws, focused_ws, state_hydration)
 
@@ -1043,6 +1092,7 @@ def refresh_live_workspace_previews(i3conn, workspace_keys, overview):
         return False
     PREVIEW_SWEEP_RUNNING = True
     refreshed = False
+    excluded_window_ids = {overview['window_id']}
     try:
         for key in workspace_keys:
             if (
@@ -1062,7 +1112,7 @@ def refresh_live_workspace_previews(i3conn, workspace_keys, overview):
                     if workspace_key(ws) == key
                     and ws.ipc_data['output'] == overview['output']
                     and any(
-                        getattr(con, 'window_class', None) != SELF_WIN_CLASS
+                        is_live_preview_client(con, excluded_window_ids)
                         for con in ws.leaves()
                     )
                 ),
@@ -1093,6 +1143,7 @@ def refresh_live_workspace_previews(i3conn, workspace_keys, overview):
             screenshot, captured = compose_workspace_preview(
                 target,
                 item['screenshot'],
+                excluded_window_ids=excluded_window_ids,
             )
             if captured:
                 item['screenshot'] = screenshot
@@ -1628,14 +1679,18 @@ def on_ws(i3, e):
 def on_ws_empty(i3, e):
     LOGGER.debug(' ---- on ws EMPTY: {}'.format(e.change))
 
-    workspace_names = {workspace.name for workspace in i3.get_tree().workspaces()}
-    for name, item in GLOBAL_KNOWLEDGE['wss'].items():
-        if name not in workspace_names:
-            # Keep the workspace entry so fixed named workspace layouts remain
-            # visible and selectable, but do not display windows that were closed.
-            item['screenshot'] = []
-            item['last-update'] = 0.0
-            item['state'] = 0
+    tree = i3.get_tree()
+    live_keys = {workspace_key(workspace) for workspace in tree.workspaces()}
+    for key in list(GLOBAL_KNOWLEDGE['wss']):
+        if key not in live_keys:
+            del GLOBAL_KNOWLEDGE['wss'][key]
+
+    if GLOBAL_KNOWLEDGE['active'] not in GLOBAL_KNOWLEDGE['wss']:
+        focused = tree.find_focused()
+        focused_ws = focused.workspace() if focused is not None else None
+        GLOBAL_KNOWLEDGE['active'] = (
+            workspace_key(focused_ws) if focused_ws is not None else None
+        )
 
 
 def on_ws_rename(i3, e):

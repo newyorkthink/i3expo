@@ -1,5 +1,6 @@
 import ctypes
 import configparser
+import pickle
 from types import SimpleNamespace
 
 from PIL import Image
@@ -77,6 +78,38 @@ def test_hydration_discards_corrupt_preview():
     assert item['last-update'] == 0.0
 
 
+def test_previous_release_preview_cache_is_invalidated(tmp_path, monkeypatch):
+    state_path = tmp_path / 'i3expo.state'
+    state = {
+        'timestamp': main._unix_time_now(),
+        'gknowledge': {
+            'active': 'a',
+            'prev_f_w': None,
+            'wss': {
+                'a': {
+                    'name': 'a',
+                    'screenshot': [2, 1, bytearray(6)],
+                    'last-update': 10.0,
+                    'state': 99,
+                },
+            },
+        },
+    }
+    state_path.write_bytes(pickle.dumps(state))
+    config = configparser.ConfigParser()
+    config.read_dict({'CONF': {
+        'state_f': str(state_path),
+        'max_persisted_state_age_sec': '604800',
+    }})
+    monkeypatch.setattr(main, 'CONFIG', config, raising=False)
+
+    loaded = main.load_global_knowledge()
+
+    assert loaded['wss']['a']['screenshot'] == []
+    assert loaded['wss']['a']['last-update'] == 0.0
+    assert loaded['wss']['a']['state'] == 0
+
+
 def test_live_ctypes_screenshot_buffer_is_valid():
     pixels = (ctypes.c_ubyte * 8 * 6 * 3)()
 
@@ -129,6 +162,59 @@ def test_workspace_preview_composes_fresh_client_over_cached_frame(monkeypatch):
     assert result.getpixel((1, 1)) == (255, 0, 0)
     assert result.getpixel((2, 1)) == (255, 0, 0)
     assert result.getpixel((0, 0)) == (0, 0, 0)
+
+
+def test_workspace_preview_excludes_overview_and_sticky_windows(monkeypatch):
+    config = configparser.ConfigParser()
+    config.read_dict({'CONF': {'bgcolor': '#0A001F'}})
+    monkeypatch.setattr(main, 'CONFIG', config, raising=False)
+    rect = SimpleNamespace(x=0, y=0, width=2, height=1)
+    leaves = [
+        SimpleNamespace(
+            window=998,
+            window_class='unexpected-class',
+            sticky=False,
+            rect=rect,
+            window_rect=rect,
+        ),
+        SimpleNamespace(
+            window=200,
+            window_class='clipboard-popup',
+            sticky=False,
+            parent=SimpleNamespace(sticky=True, parent=None),
+            rect=rect,
+            window_rect=rect,
+        ),
+        SimpleNamespace(
+            window=300,
+            window_class='I3EXPO',
+            sticky=False,
+            rect=rect,
+            window_rect=rect,
+        ),
+        SimpleNamespace(
+            window=100,
+            window_class='browser',
+            sticky=False,
+            rect=rect,
+            window_rect=rect,
+        ),
+    ]
+    ws = workspace('b', -1, 20, width=2, height=1, leaves=leaves)
+    captured_ids = []
+
+    screenshot, captured = main.compose_workspace_preview(
+        ws,
+        [],
+        capture_window=lambda window_id: (
+            captured_ids.append(window_id) or Image.new('RGB', (2, 1), 'red')
+        ),
+        excluded_window_ids={998},
+    )
+
+    assert captured == 1
+    assert captured_ids == [100]
+    assert screenshot[0:2] == [2, 1]
 
 
 def test_force_refresh_bypasses_rate_limit():
@@ -329,15 +415,17 @@ def test_live_refresh_maps_workspaces_behind_overview_and_restores(monkeypatch):
     monkeypatch.setattr(main, 'CONFIG', config, raising=False)
     monkeypatch.setattr(main, 'GLOBAL_UPDATES_RUNNING', False)
     monkeypatch.setattr(main.time, 'sleep', lambda _seconds: None)
-    monkeypatch.setattr(
-        main,
-        'compose_workspace_preview',
-        lambda ws, _previous: ([
+    captured_exclusions = []
+
+    def compose(ws, _previous, excluded_window_ids=None):
+        captured_exclusions.append(excluded_window_ids)
+        return ([
             ws.rect.width,
             ws.rect.height,
             bytearray(ws.rect.width * ws.rect.height * 3),
-        ], 1),
-    )
+        ], 1)
+
+    monkeypatch.setattr(main, 'compose_workspace_preview', compose)
     monkeypatch.setattr(main, 'update_tree_state', lambda _ws, _item: True)
     overview = {
         'con_id': 999,
@@ -360,6 +448,7 @@ def test_live_refresh_maps_workspaces_behind_overview_and_restores(monkeypatch):
     ]
     assert main.GLOBAL_KNOWLEDGE['wss']['a']['screenshot']
     assert main.GLOBAL_KNOWLEDGE['wss']['b']['screenshot']
+    assert captured_exclusions == [{998}, {998}]
     assert main.GLOBAL_KNOWLEDGE['active'] == 'a'
     assert main.PREVIEW_SWEEP_RUNNING is False
 
@@ -564,19 +653,60 @@ def test_rename_preserves_workspace_order_and_active_key():
     assert main.GLOBAL_KNOWLEDGE['active'] == 'app'
 
 
-def test_empty_workspace_is_kept_but_stale_preview_is_removed():
+def test_destroyed_workspace_is_removed_from_overview():
     reset_knowledge()
     main.GLOBAL_KNOWLEDGE['wss'] = {
         'a': {'screenshot': [1], 'last-update': 10.0, 'state': 1},
         'k': {'screenshot': [2], 'last-update': 20.0, 'state': 2},
     }
-    tree = SimpleNamespace(workspaces=lambda: [SimpleNamespace(name='a')])
+    focused_ws = SimpleNamespace(name='a')
+    focused = SimpleNamespace(workspace=lambda: focused_ws)
+    tree = SimpleNamespace(
+        workspaces=lambda: [focused_ws],
+        find_focused=lambda: focused,
+    )
     connection = SimpleNamespace(get_tree=lambda: tree)
     event = SimpleNamespace(change='empty')
 
     main.on_ws_empty(connection, event)
 
-    assert list(main.GLOBAL_KNOWLEDGE['wss']) == ['a', 'k']
-    assert main.GLOBAL_KNOWLEDGE['wss']['k']['screenshot'] == []
-    assert main.GLOBAL_KNOWLEDGE['wss']['k']['last-update'] == 0.0
-    assert main.GLOBAL_KNOWLEDGE['wss']['k']['state'] == 0
+    assert list(main.GLOBAL_KNOWLEDGE['wss']) == ['a']
+    assert main.GLOBAL_KNOWLEDGE['active'] == 'a'
+
+
+def test_startup_prunes_destroyed_workspaces_from_saved_state(monkeypatch):
+    a = workspace('a', -1, 10)
+    focused = SimpleNamespace(workspace=lambda: a)
+    tree = SimpleNamespace(
+        workspaces=lambda: [a],
+        find_focused=lambda: focused,
+    )
+    saved = {
+        'active': 'l',
+        'prev_f_w': None,
+        'wss': {
+            'a': {'name': 'a'},
+            'l': {'name': 'l'},
+        },
+    }
+    updated = []
+
+    monkeypatch.setattr(main, 'load_global_knowledge', lambda: saved)
+    monkeypatch.setattr(
+        main,
+        'i3',
+        SimpleNamespace(get_tree=lambda: tree),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        main,
+        'update_workspace',
+        lambda ws, focused_ws, hydration: updated.append(
+            (ws.name, focused_ws.name, hydration)
+        ),
+    )
+
+    main.init_knowledge()
+
+    assert list(main.GLOBAL_KNOWLEDGE['wss']) == ['a']
+    assert updated == [('a', 'a', True)]
