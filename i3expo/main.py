@@ -42,6 +42,7 @@ SELF_WIN_CLASS = 'i3expo'
 pp = pprint.PrettyPrinter(indent=4)
 
 GLOBAL_UPDATES_RUNNING = True  # if false, we don't grab any screenshots/update internal state
+PREVIEW_SWEEP_RUNNING = False  # true while unseen workspaces are visited for their first preview
 
 qm_cache = {}  # screen_w x screen_h mapped against rendered question mark for missing tiles
 LOCK = None
@@ -222,9 +223,10 @@ def signal_toggle_ui(signal, stack_frame):
 
     wss = shown_ws()
     if len(wss) > 1:  # i.e. should show UI
-        # Refresh the visible workspace immediately before drawing the grid.
-        # Other workspaces use the last screenshot captured while they were
-        # visible, which is the only reliable method on non-compositing i3/X11.
+        capture_missing_workspace_previews(i3, wss)
+        wss = shown_ws()
+        # Refresh the visible workspace immediately before drawing the grid;
+        # missing non-empty workspaces were mapped and captured just above.
         update_state(i3, force=True)
         # i3.command('workspace i3expo-temporary-workspace')  # jump to temp ws; doesn't seem to work well in multimon setup; introduced by  https://gitlab.com/d.reis/i3expo/-/commit/d14685d16fd140b3a7374887ca086ea66e0388f5 - looks like it solves problem where fullscreen state is lost on expo toggle
         GLOBAL_UPDATES_RUNNING = False
@@ -298,6 +300,121 @@ def grab_screen(i):
     return [w, h, result]
 
 
+def screenshot_is_valid(screenshot) -> bool:
+    """Return whether a persisted screenshot has a complete RGB buffer."""
+    try:
+        w, h, pixels = screenshot
+        try:
+            buffer_size = ctypes.sizeof(pixels)
+        except TypeError:
+            buffer_size = len(pixels)
+        return w > 0 and h > 0 and buffer_size == w * h * 3
+    except (TypeError, ValueError):
+        return False
+
+
+def quote_i3_string(value) -> str:
+    """Quote a workspace name for use in an i3 command."""
+    value = str(value).replace('\\', '\\\\').replace('"', '\\"')
+    return '"{}"'.format(value)
+
+
+def wait_for_workspace(i3conn, name, timeout=1.5):
+    """Wait until i3 has focused ``name`` and return its live tree objects."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        tree = i3conn.get_tree()
+        focused_con = tree.find_focused()
+        if focused_con is not None:
+            focused_ws = focused_con.workspace()
+            if focused_ws is not None and focused_ws.name == name:
+                return tree, focused_con, focused_ws
+        time.sleep(0.05)
+    return None
+
+
+def capture_missing_workspace_previews(i3conn, workspace_keys):
+    """Visit unseen, non-empty workspaces once and cache their screenshots.
+
+    X11 cannot capture an i3 workspace which has never been mapped.  The sweep
+    therefore switches only to live workspaces that have windows and no cached
+    preview, then restores the exact container which was focused beforehand.
+    """
+    global PREVIEW_SWEEP_RUNNING
+
+    tree = i3conn.get_tree()
+    original_con = tree.find_focused()
+    if original_con is None or original_con.workspace() is None:
+        return
+
+    original_ws = original_con.workspace()
+    original_con_id = original_con.id
+    requested = set(workspace_keys)
+    targets = [
+        ws for ws in tree.workspaces()
+        if (
+            workspace_key(ws) in requested
+            and workspace_key(ws) != workspace_key(original_ws)
+            and ws.leaves()
+            and not GLOBAL_KNOWLEDGE['wss'][workspace_key(ws)]['screenshot']
+        )
+    ]
+    if not targets:
+        return
+
+    PREVIEW_SWEEP_RUNNING = True
+    UPDATER_DEBOUNCED.reset()
+    WS_UPDATE_DEBOUNCED.reset()
+    try:
+        for target in targets:
+            name = target.name
+            try:
+                i3conn.command(
+                    'workspace --no-auto-back-and-forth {}'.format(
+                        quote_i3_string(name)
+                    )
+                )
+                focused = wait_for_workspace(i3conn, name)
+                if focused is None:
+                    LOGGER.warning(
+                        'Timed out while preparing preview for workspace %s', name
+                    )
+                    continue
+
+                # Give applications one normal frame to repaint after mapping.
+                time.sleep(0.2)
+                tree, focused_con, focused_ws = (
+                    wait_for_workspace(i3conn, name) or focused
+                )
+                wk = update_workspace(focused_ws, focused_ws)
+                wk['screenshot'] = grab_screen(wk)
+                wk['last-update'] = time.time()
+                update_tree_state(focused_ws, wk)
+            except Exception:
+                LOGGER.exception('Unable to prepare preview for workspace %s', name)
+    finally:
+        try:
+            i3conn.command('[con_id={}] focus'.format(original_con_id))
+            restored = wait_for_workspace(i3conn, original_ws.name)
+            if restored is None:
+                i3conn.command(
+                    'workspace --no-auto-back-and-forth {}'.format(
+                        quote_i3_string(original_ws.name)
+                    )
+                )
+                restored = wait_for_workspace(i3conn, original_ws.name)
+            if restored is not None:
+                tree, focused_con, focused_ws = restored
+                update_workspace(focused_ws, focused_ws)
+        except Exception:
+            LOGGER.exception(
+                'Unable to restore workspace %s after preview capture',
+                original_ws.name,
+            )
+        finally:
+            PREVIEW_SWEEP_RUNNING = False
+
+
 def workspace_key(ws) -> str:
     """Return the only collision-free i3 workspace identifier.
 
@@ -328,15 +445,14 @@ def update_workspace(ws, focused_ws, hydration=False) -> dict:
             'ff'          : None   # float-focus; ID of a floating window to focus when we return to this WS
         }
 
-    current_size = (ws.rect.width, ws.rect.height)
-    stored_size = (i.get('w', 0), i.get('h', 0))
-    if hydration and i.get('screenshot') and stored_size != current_size:
-        # A cached image with old output dimensions cannot be rendered safely.
+    if hydration and i.get('screenshot') and not screenshot_is_valid(i['screenshot']):
+        # Ignore corrupt/incomplete cache data, but keep valid previews when the
+        # bar or output dimensions changed: pygame safely scales those images.
         i['screenshot'] = []
         i['last-update'] = 0.0
 
-    # Always refresh live metadata; screenshots are retained only when their
-    # dimensions still match the current output.
+    # Always refresh live metadata. Cached screenshots keep their own dimensions
+    # and can be scaled even when a panel changed the live workspace rectangle.
     i['op'] = ws.ipc_data['output']
     i['name'] = ws.name
     i['num'] = ws.num
@@ -408,7 +524,8 @@ def update_state(i3, e=None, rate_limit_period=None,
     tree = i3.get_tree()
     focused_con = tree.find_focused()
 
-    if (not GLOBAL_UPDATES_RUNNING or
+    if (PREVIEW_SWEEP_RUNNING or
+        not GLOBAL_UPDATES_RUNNING or
         focused_con.window_class in WIN_CLASS_BLACKLIST):  # note assumes WindowEvent
             LOGGER.debug('] update skipped')
             UPDATER_DEBOUNCED.reset()
@@ -864,6 +981,9 @@ def on_ws(i3, e):
     focused_ws = tree.find_focused().workspace()
     gk = update_workspace(e.current, focused_ws)
 
+    if PREVIEW_SWEEP_RUNNING:
+        return
+
     if not GLOBAL_UPDATES_RUNNING:
         # this block gets executed if we exit expo by moving focus to other WS, ie. not by toggling WS change via expo itself
 
@@ -931,6 +1051,9 @@ def on_ws_rename(i3, e):
 def on_win_focus(i3, e):
     LOGGER.debug(' ---- on win FOCUS: {}'.format(e.change))
 
+    if PREVIEW_SWEEP_RUNNING:
+        return
+
     # TODO: perhaps here we should also check whether the blacklisted window
     #       is still visible in this if-block?
     if GLOBAL_KNOWLEDGE['prev_f_w'] in WIN_CLASS_BLACKLIST:
@@ -944,6 +1067,8 @@ def on_win_focus(i3, e):
 
 def on_win_title(i3, e):
     LOGGER.debug(' ---- on win TITLE: {}'.format(e.change))
+    if PREVIEW_SWEEP_RUNNING:
+        return
     if e.container.focused:  # we only care for win title change if it's focused
         UPDATER_DEBOUNCED(i3, e)
 

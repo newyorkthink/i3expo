@@ -179,7 +179,7 @@ jobs:
         run: |
           set -euo pipefail
           RELEASE_TITLE="i3expo Stable"
-          RELEASE_NOTES="Stable x86_64 AppImage for i3/X11. Includes named workspace handling, preserved workspace order, persistent preview caching, active preview refresh, a warning-free font fallback, and a borderless overview window. This workflow runs only when started manually."
+          RELEASE_NOTES="Stable x86_64 AppImage for i3/X11. Includes named workspace handling, first-open capture for unseen non-empty workspaces, preserved workspace order, persistent preview caching, active preview refresh, a warning-free font fallback, and a borderless overview window. This workflow runs only when started manually."
 
           if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
             gh release upload "$RELEASE_TAG" \
