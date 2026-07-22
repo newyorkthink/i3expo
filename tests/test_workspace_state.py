@@ -2,6 +2,8 @@ import ctypes
 import configparser
 from types import SimpleNamespace
 
+from PIL import Image
+
 from i3expo import main
 
 
@@ -79,6 +81,54 @@ def test_live_ctypes_screenshot_buffer_is_valid():
     pixels = (ctypes.c_ubyte * 8 * 6 * 3)()
 
     assert main.screenshot_is_valid([8, 6, pixels])
+
+
+def test_decode_ximage_converts_little_endian_bgrx():
+    display_info = SimpleNamespace(
+        image_byte_order=0,
+        pixmap_formats=[SimpleNamespace(
+            depth=24,
+            bits_per_pixel=32,
+            scanline_pad=32,
+        )],
+    )
+    image = main.decode_ximage(
+        bytes((3, 2, 1, 0, 30, 20, 10, 0)),
+        2,
+        1,
+        24,
+        display_info,
+    )
+
+    assert image.getpixel((0, 0)) == (1, 2, 3)
+    assert image.getpixel((1, 0)) == (10, 20, 30)
+
+
+def test_workspace_preview_composes_fresh_client_over_cached_frame(monkeypatch):
+    config = configparser.ConfigParser()
+    config.read_dict({'CONF': {'bgcolor': '#0A001F'}})
+    monkeypatch.setattr(main, 'CONFIG', config, raising=False)
+    leaf = SimpleNamespace(
+        window=100,
+        window_class='browser',
+        rect=SimpleNamespace(x=1, y=1, width=2, height=1),
+        window_rect=SimpleNamespace(x=0, y=0, width=2, height=1),
+    )
+    ws = workspace('b', -1, 20, width=4, height=3, leaves=[leaf])
+    previous = [4, 3, bytearray(4 * 3 * 3)]
+    red_client = Image.new('RGB', (2, 1), '#ff0000')
+
+    screenshot, captured = main.compose_workspace_preview(
+        ws,
+        previous,
+        capture_window=lambda _window: red_client,
+    )
+
+    result = Image.frombytes('RGB', (4, 3), bytes(screenshot[2]))
+    assert captured == 1
+    assert result.getpixel((1, 1)) == (255, 0, 0)
+    assert result.getpixel((2, 1)) == (255, 0, 0)
+    assert result.getpixel((0, 0)) == (0, 0, 0)
 
 
 def test_force_refresh_bypasses_rate_limit():
@@ -236,6 +286,136 @@ def test_auto_capture_discovers_new_workspace_from_live_tree(monkeypatch):
     assert calls == [(connection, ['a', 'i'], 0.2)]
 
 
+def test_live_refresh_maps_workspaces_behind_overview_and_restores(monkeypatch):
+    reset_knowledge()
+    leaf = SimpleNamespace(
+        id=100,
+        name='browser',
+        focused=False,
+        window=100,
+        window_class='browser',
+        rect=SimpleNamespace(x=0, y=0, width=16, height=9),
+        window_rect=SimpleNamespace(x=0, y=0, width=16, height=9),
+    )
+    a = workspace('a', -1, 10, width=16, height=9, leaves=[leaf])
+    b = workspace('b', -1, 20, width=16, height=9, leaves=[leaf])
+    workspaces = [a, b]
+    for ws in workspaces:
+        main.update_workspace(ws, a)
+
+    class Connection:
+        def __init__(self):
+            self.current = a
+            self.commands = []
+
+        def get_tree(self):
+            focused = SimpleNamespace(workspace=lambda: self.current)
+            return SimpleNamespace(
+                find_focused=lambda: focused,
+                workspaces=lambda: workspaces,
+            )
+
+        def command(self, command):
+            self.commands.append(command)
+            if command.startswith('workspace'):
+                self.current = next(
+                    ws for ws in workspaces
+                    if command.endswith(main.quote_i3_string(ws.name))
+                )
+
+    connection = Connection()
+    config = configparser.ConfigParser()
+    config.read_dict({'CONF': {'live_preview_map_delay_sec': '0.0'}})
+    monkeypatch.setattr(main, 'CONFIG', config, raising=False)
+    monkeypatch.setattr(main, 'GLOBAL_UPDATES_RUNNING', False)
+    monkeypatch.setattr(main.time, 'sleep', lambda _seconds: None)
+    monkeypatch.setattr(
+        main,
+        'compose_workspace_preview',
+        lambda ws, _previous: ([
+            ws.rect.width,
+            ws.rect.height,
+            bytearray(ws.rect.width * ws.rect.height * 3),
+        ], 1),
+    )
+    monkeypatch.setattr(main, 'update_tree_state', lambda _ws, _item: True)
+    overview = {
+        'con_id': 999,
+        'window_id': 998,
+        'workspace': 'a',
+        'output': 'eDP-1',
+    }
+
+    assert main.refresh_live_workspace_previews(
+        connection,
+        ['a', 'b'],
+        overview,
+    )
+
+    assert connection.commands == [
+        'workspace --no-auto-back-and-forth "a"',
+        'workspace --no-auto-back-and-forth "b"',
+        'workspace --no-auto-back-and-forth "a"',
+        '[con_id=999] focus',
+    ]
+    assert main.GLOBAL_KNOWLEDGE['wss']['a']['screenshot']
+    assert main.GLOBAL_KNOWLEDGE['wss']['b']['screenshot']
+    assert main.GLOBAL_KNOWLEDGE['active'] == 'a'
+    assert main.PREVIEW_SWEEP_RUNNING is False
+
+
+def test_live_overview_becomes_full_output_sticky_curtain(monkeypatch):
+    reset_knowledge()
+    main.GLOBAL_KNOWLEDGE['active'] = 'a'
+    config = configparser.ConfigParser()
+    config.read_dict({'CONF': {'live_previews': 'true'}})
+    commands = []
+    overview_con = SimpleNamespace(id=999)
+    output = SimpleNamespace(
+        name='eDP-1',
+        rect=SimpleNamespace(x=0, y=0, width=1920, height=1080),
+    )
+
+    class Connection:
+        def get_tree(self):
+            return SimpleNamespace(find_by_window=lambda window: overview_con)
+
+        def get_outputs(self):
+            return [output]
+
+        def command(self, command):
+            commands.append(command)
+            return [SimpleNamespace(success=True)]
+
+    monkeypatch.setattr(main, 'CONFIG', config, raising=False)
+    monkeypatch.setattr(main, 'i3', Connection(), raising=False)
+    monkeypatch.setattr(main, 'xcomposite_available', lambda: True)
+    monkeypatch.setattr(main.pygame.display, 'get_wm_info', lambda: {'window': 555})
+    monkeypatch.setattr(main.pygame.event, 'pump', lambda: None)
+    monkeypatch.setattr(main.pygame.event, 'clear', lambda: None)
+    monkeypatch.setattr(main.time, 'sleep', lambda _seconds: None)
+
+    context = main.prepare_live_overview_window({
+        'op': 'eDP-1',
+        'x': 0,
+        'y': 0,
+        'w': 1920,
+        'h': 1058,
+    })
+
+    assert context == {
+        'con_id': 999,
+        'window_id': 555,
+        'workspace': 'a',
+        'output': 'eDP-1',
+    }
+    assert commands == [
+        '[con_id=999] fullscreen disable, floating enable, sticky enable, '
+        'border pixel 0, resize set 1920 px 1080 px, '
+        'move absolute position 0 px 0 px'
+    ]
+
+
 def test_new_window_event_queues_normal_refresh_and_auto_scan(monkeypatch):
     class Recorder:
         def __init__(self):
@@ -282,6 +462,7 @@ def test_first_run_creates_editable_default_config(tmp_path, monkeypatch):
     assert 'names_color = #FF5FFF' in text
     assert 'names_font = default' in text
     assert 'startup_scan = true' in text
+    assert 'live_previews = true' in text
     assert 'toggle_shortcut = Mod4+e' in text
     assert config.get('CONF', 'bgcolor') == '#0A001F'
 
@@ -310,6 +491,9 @@ def test_first_run_creates_editable_default_config(tmp_path, monkeypatch):
         'auto_scan_new_workspaces',
         'new_workspace_scan_delay_sec',
         'workspace_capture_delay_sec',
+        'live_previews',
+        'live_preview_interval_sec',
+        'live_preview_map_delay_sec',
         'toggle_shortcut',
         'store_state_on_restart',
         'max_persisted_state_age_sec',

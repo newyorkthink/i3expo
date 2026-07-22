@@ -105,6 +105,12 @@ auto_scan_new_workspaces = true
 new_workspace_scan_delay_sec = 0.8
 # 切换工作区后等待画面重绘的秒数 / Repaint delay after switching workspaces
 workspace_capture_delay_sec = 0.2
+# 概览打开时是否在遮罩后轮询并实时更新其他工作区 / Refresh hidden workspaces behind the overview
+live_previews = true
+# 两轮实时预览刷新之间的等待秒数 / Delay between live-preview refresh rounds
+live_preview_interval_sec = 1.0
+# 后台映射每个工作区后等待窗口重绘的秒数 / Repaint delay for each background-mapped workspace
+live_preview_map_delay_sec = 0.08
 
 # 全局 X11 开关快捷键；示例：Mod4+e、Alt+Tab、Ctrl+Shift+space。
 # Global X11 toggle shortcut; examples: Mod4+e, Alt+Tab, Ctrl+Shift+space.
@@ -124,6 +130,7 @@ log_lvl = INFO
 LEGACY_DEFAULT_CONFIG_SHA256ES = {
     '225c21f6f906711e8cb268937f9ca7b7a28e856e42cf52a530fff0136a750731',
     'f583bbb1faf293a98292b3873fea528fdf62e1bf7b5dcf931ec2df4d37b94799',
+    '189073a279b2a87755846159eeb97544676c02aeeb707f718f9620c38b4990fa',
 }
 
 
@@ -392,6 +399,9 @@ def read_config():
             'auto_scan_new_workspaces'   : True,
             'new_workspace_scan_delay_sec': 0.8,
             'workspace_capture_delay_sec': 0.2,
+            'live_previews'               : True,
+            'live_preview_interval_sec'   : 1.0,
+            'live_preview_map_delay_sec'  : 0.08,
             'toggle_shortcut'            : 'Mod4+e',
             'screenshot_lib_path'        : os.path.join(os.path.dirname(os.path.realpath(__file__)), 'prtscn.so'),
             'store_state_on_restart'     : True,
@@ -425,6 +435,191 @@ def grab_screen(i):
     result = (ctypes.c_ubyte * w * h * 3)()  # *3 for R,G,B
     GRAB.getScreen(i['x'], i['y'], w, h, result)
     return [w, h, result]
+
+
+def decode_ximage(data, width, height, depth, display_info):
+    """Convert a common X11 ZPixmap reply into a Pillow RGB image."""
+    pixel_format = next(
+        (item for item in display_info.pixmap_formats if item.depth == depth),
+        None,
+    )
+    if pixel_format is None:
+        raise ValueError('X11 returned an unsupported pixmap depth')
+
+    bits_per_pixel = pixel_format.bits_per_pixel
+    scanline_pad = pixel_format.scanline_pad
+    stride = (
+        ((width * bits_per_pixel + scanline_pad - 1) // scanline_pad)
+        * (scanline_pad // 8)
+    )
+    little_endian = display_info.image_byte_order == 0
+    if bits_per_pixel == 32:
+        raw_mode = 'BGRX' if little_endian else 'RGBX'
+    elif bits_per_pixel == 24:
+        raw_mode = 'BGR' if little_endian else 'RGB'
+    else:
+        raise ValueError(
+            'X11 pixmap uses unsupported {}-bit pixels'.format(bits_per_pixel)
+        )
+    return Image.frombytes(
+        'RGB',
+        (width, height),
+        data,
+        'raw',
+        raw_mode,
+        stride,
+        1,
+    )
+
+
+def grab_xcomposite_window(window_id):
+    """Capture a mapped X11 client even while another window covers it."""
+    if not window_id:
+        return None
+
+    from Xlib import X, display, error
+    from Xlib.ext import composite
+
+    xdisplay = None
+    pixmap = None
+    redirected = False
+    window = None
+    try:
+        xdisplay = display.Display()
+        if not xdisplay.has_extension('Composite'):
+            return None
+        window = xdisplay.create_resource_object('window', int(window_id))
+        attributes = window.get_attributes()
+        if attributes.map_state != X.IsViewable:
+            return None
+
+        redirect_error = error.CatchError()
+        window.composite_redirect_window(
+            composite.RedirectAutomatic,
+            onerror=redirect_error,
+        )
+        xdisplay.sync()
+        redirected = redirect_error.get_error() is None
+
+        pixmap_error = error.CatchError()
+        pixmap = window.composite_name_window_pixmap(onerror=pixmap_error)
+        xdisplay.sync()
+        if pixmap_error.get_error() is not None:
+            return None
+
+        geometry = pixmap.get_geometry()
+        if geometry.width <= 0 or geometry.height <= 0:
+            return None
+        image = pixmap.get_image(
+            0,
+            0,
+            geometry.width,
+            geometry.height,
+            X.ZPixmap,
+            X.AllPlanes,
+        )
+        if image is None:
+            return None
+        return decode_ximage(
+            image.data,
+            geometry.width,
+            geometry.height,
+            geometry.depth,
+            xdisplay.display.info,
+        )
+    except Exception as exc:
+        LOGGER.debug(
+            'Unable to capture XComposite window %s: %s',
+            window_id,
+            exc,
+        )
+        return None
+    finally:
+        if pixmap is not None:
+            try:
+                pixmap.free(onerror=error.CatchError())
+            except Exception:
+                pass
+        if redirected and window is not None:
+            try:
+                window.composite_unredirect_window(
+                    composite.RedirectAutomatic,
+                    onerror=error.CatchError(),
+                )
+            except Exception:
+                pass
+        if xdisplay is not None:
+            try:
+                xdisplay.close()
+            except Exception:
+                pass
+
+
+def xcomposite_available():
+    """Return whether the current X server exposes the Composite extension."""
+    from Xlib import display
+
+    xdisplay = None
+    try:
+        xdisplay = display.Display()
+        return xdisplay.has_extension('Composite')
+    except Exception:
+        return False
+    finally:
+        if xdisplay is not None:
+            try:
+                xdisplay.close()
+            except Exception:
+                pass
+
+
+def compose_workspace_preview(ws, previous, capture_window=grab_xcomposite_window):
+    """Overlay fresh client pixmaps on a cached full-workspace screenshot."""
+    width = ws.rect.width
+    height = ws.rect.height
+    if screenshot_is_valid(previous):
+        base = Image.frombuffer(
+            'RGB',
+            (previous[0], previous[1]),
+            previous[2],
+            'raw',
+            'RGB',
+            0,
+            1,
+        ).copy()
+        if base.size != (width, height):
+            base = base.resize((width, height), Image.Resampling.LANCZOS)
+    else:
+        base = Image.new('RGB', (width, height), CONFIG.get('CONF', 'bgcolor'))
+
+    captured = 0
+    for con in ws.leaves():
+        if not getattr(con, 'window', None):
+            continue
+        if getattr(con, 'window_class', None) == SELF_WIN_CLASS:
+            continue
+        client = capture_window(con.window)
+        if client is None:
+            continue
+
+        window_rect = getattr(con, 'window_rect', None)
+        client_width = getattr(window_rect, 'width', 0) or con.rect.width
+        client_height = getattr(window_rect, 'height', 0) or con.rect.height
+        if client_width <= 0 or client_height <= 0:
+            continue
+        if client.size != (client_width, client_height):
+            client = client.resize(
+                (client_width, client_height),
+                Image.Resampling.LANCZOS,
+            )
+        destination_x = con.rect.x - ws.rect.x + getattr(window_rect, 'x', 0)
+        destination_y = con.rect.y - ws.rect.y + getattr(window_rect, 'y', 0)
+        base.paste(client, (destination_x, destination_y))
+        captured += 1
+
+    if captured == 0:
+        return previous, 0
+    return [width, height, bytearray(base.tobytes())], captured
 
 
 def screenshot_is_valid(screenshot) -> bool:
@@ -762,6 +957,188 @@ def get_hovered_tile(mpos, tiles):
     return None
 
 
+def prepare_live_overview_window(workspace):
+    """Make the overview a sticky floating curtain while workspaces rotate."""
+    if not CONFIG.getboolean('CONF', 'live_previews'):
+        return None
+    if not xcomposite_available():
+        LOGGER.warning('Live previews disabled: XComposite is unavailable')
+        return None
+    window_id = pygame.display.get_wm_info().get('window')
+    if not window_id:
+        LOGGER.warning('Live previews disabled: SDL did not expose its X11 window')
+        return None
+
+    deadline = time.monotonic() + 1.5
+    overview = None
+    while time.monotonic() < deadline:
+        overview = i3.get_tree().find_by_window(int(window_id))
+        if overview is not None:
+            break
+        time.sleep(0.03)
+    if overview is None:
+        LOGGER.warning('Live previews disabled: i3 did not manage the overview window')
+        return None
+
+    output_name = workspace['op'] if isinstance(workspace, dict) else workspace.ipc_data['output']
+    output = next(
+        (item for item in i3.get_outputs() if item.name == output_name),
+        None,
+    )
+    if output is not None:
+        x = output.rect.x
+        y = output.rect.y
+        width = output.rect.width
+        height = output.rect.height
+    elif isinstance(workspace, dict):
+        x, y, width, height = (
+            workspace['x'],
+            workspace['y'],
+            workspace['w'],
+            workspace['h'],
+        )
+    else:
+        x, y, width, height = (
+            workspace.rect.x,
+            workspace.rect.y,
+            workspace.rect.width,
+            workspace.rect.height,
+        )
+    command = (
+        '[con_id={}] fullscreen disable, floating enable, sticky enable, '
+        'border pixel 0, resize set {} px {} px, '
+        'move absolute position {} px {} px'
+    ).format(
+        overview.id,
+        width,
+        height,
+        x,
+        y,
+    )
+    replies = i3.command(command)
+    if not replies or not all(reply.success for reply in replies):
+        i3.command(
+            '[con_id={}] sticky disable, floating disable, fullscreen enable'.format(
+                overview.id
+            )
+        )
+        LOGGER.warning('Live previews disabled: unable to make overview sticky')
+        return None
+    time.sleep(0.05)
+    pygame.event.pump()
+    pygame.event.clear()
+    return {
+        'con_id': overview.id,
+        'window_id': int(window_id),
+        'workspace': GLOBAL_KNOWLEDGE['active'],
+        'output': output_name,
+    }
+
+
+def refresh_live_workspace_previews(i3conn, workspace_keys, overview):
+    """Map workspaces behind the sticky overview and capture fresh clients."""
+    global PREVIEW_SWEEP_RUNNING
+
+    if PREVIEW_SWEEP_RUNNING or overview is None:
+        return False
+    PREVIEW_SWEEP_RUNNING = True
+    refreshed = False
+    try:
+        for key in workspace_keys:
+            if (
+                GLOBAL_UPDATES_RUNNING
+                or (
+                    pygame.display.get_init()
+                    and pygame.event.peek(
+                        (pygame.QUIT, pygame.KEYDOWN, pygame.MOUSEBUTTONUP)
+                    )
+                )
+            ):
+                break
+            tree = i3conn.get_tree()
+            target = next(
+                (
+                    ws for ws in tree.workspaces()
+                    if workspace_key(ws) == key
+                    and ws.ipc_data['output'] == overview['output']
+                    and any(
+                        getattr(con, 'window_class', None) != SELF_WIN_CLASS
+                        for con in ws.leaves()
+                    )
+                ),
+                None,
+            )
+            if target is None:
+                continue
+
+            i3conn.command(
+                'workspace --no-auto-back-and-forth {}'.format(
+                    quote_i3_string(target.name)
+                )
+            )
+            focused = wait_for_workspace(i3conn, target.name)
+            if focused is None:
+                continue
+            time.sleep(
+                max(0.0, CONFIG.getfloat('CONF', 'live_preview_map_delay_sec'))
+            )
+            tree = i3conn.get_tree()
+            target = next(
+                (ws for ws in tree.workspaces() if workspace_key(ws) == key),
+                None,
+            )
+            if target is None:
+                continue
+            item = update_workspace(target, target)
+            screenshot, captured = compose_workspace_preview(
+                target,
+                item['screenshot'],
+            )
+            if captured:
+                item['screenshot'] = screenshot
+                item['last-update'] = time.time()
+                update_tree_state(target, item)
+                refreshed = True
+    except Exception:
+        LOGGER.exception('Unable to refresh live workspace previews')
+    finally:
+        try:
+            i3conn.command(
+                'workspace --no-auto-back-and-forth {}'.format(
+                    quote_i3_string(overview['workspace'])
+                )
+            )
+            wait_for_workspace(i3conn, overview['workspace'])
+            i3conn.command('[con_id={}] focus'.format(overview['con_id']))
+            GLOBAL_KNOWLEDGE['active'] = overview['workspace']
+        except Exception:
+            LOGGER.exception('Unable to restore overview after live preview refresh')
+        PREVIEW_SWEEP_RUNNING = False
+    return refreshed
+
+
+def refresh_tile_images(tiles):
+    """Replace tile surfaces after live screenshots have been updated."""
+    active_color = CONFIG.getcolor('CONF', 'frame_active_color')
+    inactive_color = CONFIG.getcolor('CONF', 'frame_inactive_color')
+    missing_color = CONFIG.getcolor('CONF', 'frame_missing_color')
+    missing_background = CONFIG.getcolor('CONF', 'tile_missing_color')
+    for tile in tiles.values():
+        item = GLOBAL_KNOWLEDGE['wss'][tile['ws']]
+        if item['screenshot']:
+            tile['img'] = process_img(item['screenshot'])
+            tile['tile_col'] = None
+            tile['frame_col'] = (
+                active_color
+                if GLOBAL_KNOWLEDGE['active'] == tile['ws']
+                else inactive_color
+            )
+        else:
+            tile['img'] = draw_missing_tile(item['w'], item['h'])
+            tile['tile_col'] = missing_background
+            tile['frame_col'] = missing_color
+
+
 def show_ui(wss):
     global GLOBAL_UPDATES_RUNNING
 
@@ -788,6 +1165,7 @@ def show_ui(wss):
             pygame.RESIZABLE | pygame.NOFRAME,
         )
     pygame.display.set_caption(SELF_WIN_CLASS)
+    live_overview = prepare_live_overview_window(ws)
 
     tiles = {}  # contains grid tile index to thumbnail/ws_screenshot data mappings
     active_tile = None
@@ -841,7 +1219,15 @@ def show_ui(wss):
 
     draw_grid(screen, grid)
     pygame.display.flip()  # update full dispaly Surface on the screen
-    i = input_event_loop(screen, tiles, active_tile, grid_layout, wss2)
+    i = input_event_loop(
+        screen,
+        tiles,
+        active_tile,
+        grid_layout,
+        wss2,
+        tile_grid=grid,
+        live_overview=live_overview,
+    )
     pygame.display.quit()
     pygame.quit()
 
@@ -1059,9 +1445,21 @@ def arrow_navigation_delta(key):
 # previously-focused window upon the closure of expo UI
 #
 # and only str output should mean returned WS-num should be focused
-def input_event_loop(screen, tiles, active_tile, grid, wss):
+def input_event_loop(
+    screen,
+    tiles,
+    active_tile,
+    grid,
+    wss,
+    tile_grid=None,
+    live_overview=None,
+):
     t1 = time.time()
     workspaces = len(wss)
+    next_live_refresh = time.monotonic() + CONFIG.getfloat(
+        'CONF',
+        'live_preview_interval_sec',
+    )
 
     while pygame.display.get_init():  # Returns True if the display module has been initialized
         if GLOBAL_UPDATES_RUNNING:
@@ -1069,6 +1467,19 @@ def input_event_loop(screen, tiles, active_tile, grid, wss):
             if isinstance(GLOBAL_UPDATES_RUNNING, bool):  # note bools are subclass of int, but not the other way around
                 return None
             return 1  # not string nor None
+
+        if (
+            live_overview is not None
+            and tile_grid is not None
+            and time.monotonic() >= next_live_refresh
+        ):
+            if refresh_live_workspace_previews(i3, wss, live_overview):
+                refresh_tile_images(tiles)
+                draw_grid(screen, tile_grid)
+            next_live_refresh = time.monotonic() + max(
+                0.1,
+                CONFIG.getfloat('CONF', 'live_preview_interval_sec'),
+            )
 
         is_mouse_input = False
         kbdmove = None

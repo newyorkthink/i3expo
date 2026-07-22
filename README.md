@@ -37,7 +37,7 @@ terminal in order to catch any errors in this pre-alpha stage.
 
 On first run, i3expo creates `$XDG_CONFIG_HOME/i3expo/config` (normally
 `~/.config/i3expo/config`). It contains the complete editable theme, startup scan,
-and global shortcut settings, with Chinese-English comments for every option.
+live-preview, and global shortcut settings, with Chinese-English comments for every option.
 Existing configuration files are never overwritten. Color values can use PyGame
 names, `#fff`, or `#ffffff` hex.
 
@@ -68,13 +68,14 @@ to the compiled prtscn executable.
 
 ## Limitations
 
-Since it works by taking screenshots, X11 cannot provide an image for a workspace
-which has never been mapped. The default startup scan briefly maps each non-empty
-workspace, refreshes its preview, and restores the original window focus. This scan
-is automatic but cannot be completely invisible on a non-compositing window manager.
-New workspace and window events are also scanned automatically, with a periodic
-fallback in case an event is missed. Empty workspaces keep the question-mark
-placeholder until they contain a window that can be captured.
+Since i3 unmaps inactive workspaces, the default startup scan briefly maps each
+non-empty workspace once and restores the original window focus. While the overview
+is open, `live_previews` keeps the overview as a sticky floating curtain, rotates
+same-output workspaces behind it, and uses XComposite window pixmaps to refresh the
+tiles. This allows video and other changing windows to update without exposing each
+workspace switch. `live_preview_interval_sec` controls the delay between refresh
+rounds. Empty workspaces keep the question-mark placeholder until they contain a
+window that can be captured.
 
 ## Caution
 
