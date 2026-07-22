@@ -21,7 +21,7 @@ concurrency:
 
 env:
   APPIMAGE_NAME: i3expo-x86_64.AppImage
-  RELEASE_TAG: v0.0.8-dev0-appimage.1
+  RELEASE_TAG: v0.0.8-dev0-appimage.2
 
 jobs:
   build-appimage:
@@ -69,6 +69,7 @@ jobs:
           import xdg
           from PIL import Image
           from tendo import singleton
+          from i3expo.appimage_fix import install
 
           print("Python dependency import check passed")
           PY
@@ -78,10 +79,12 @@ jobs:
         run: |
           set -euo pipefail
           cat > appimage_entry.py <<'PY'
-          from i3expo import run
+          from i3expo import main as i3expo_main
+          from i3expo.appimage_fix import install
 
           if __name__ == "__main__":
-              run()
+              install()
+              i3expo_main.run()
           PY
 
           python -m PyInstaller \
@@ -185,8 +188,8 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          RELEASE_TITLE="i3expo AppImage 0.0.8.dev0"
-          RELEASE_NOTES="Standalone x86_64 AppImage for i3/X11. Python and application dependencies are bundled. The host system must provide i3, X11, and libX11."
+          RELEASE_TITLE="i3expo AppImage 0.0.8.dev0 appimage.2"
+          RELEASE_NOTES="Standalone x86_64 AppImage for i3/X11. Fixes named workspaces such as a/k/p/b being collapsed into one entry and removes the missing sans-serif warning. Hidden workspaces receive a preview after they have been visited once while i3expo is running."
 
           if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
             gh release upload "$RELEASE_TAG" \
